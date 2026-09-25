@@ -34,12 +34,41 @@ def iter_candidates(path: str):
             yield eid, cands
 
 
-def collect_need(path: str) -> set[str]:
+def collect_need(path: str) -> tuple[set[str], int]:
     need = set()
+    n = 0
     for eid, cands in iter_candidates(path):
         need.add(eid)
         need.update(cands)
-    return need
+        n += 1
+    return need, n
+
+
+_PRED: dict = {}
+
+
+def _predict_span(bounds: tuple[int, int]) -> list[tuple[str, list[str]]]:
+    import lightgbm as lgb
+
+    start, end = bounds
+    state = _PRED
+    booster = lgb.Booster(model_file=state["model"])
+    records = state["records"]
+    threshold = state["threshold"]
+    rows = []
+    with open(state["candidates"], encoding="utf-8") as handle:
+        handle.readline()
+        for i, line in enumerate(handle):
+            if i < start:
+                continue
+            if i >= end:
+                break
+            line = line.rstrip("\n")
+            eid, rest = line.split("\t", 1)
+            cands = [c for c in rest.split(",") if c] if rest else []
+            chosen = score_candidates(booster, records, eid, cands, threshold) if cands else []
+            rows.append((eid, chosen))
+    return rows
 
 
 def unique(ids: list[str]) -> list[str]:
@@ -77,23 +106,44 @@ def run(args: argparse.Namespace) -> None:
     print(f"Threshold {threshold:.3f}", flush=True)
     names = ("test_s1", "test_s2", "test_s3") if args.split == "test" else ("train_s1", "train_s2", "train_s3")
     print("Collecting ids", flush=True)
-    need = collect_need(args.candidates)
+    need, n_rows = collect_need(args.candidates)
     print(f"Loading {len(need):,} records", flush=True)
     records = load_records(args.preprocessed, need, names=names)
-    booster = lgb.Booster(model_file=args.model)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    n = 0
+    workers = 4 if os.name == "posix" and n_rows >= 4000 else 1
+    print(f"Scoring {n_rows:,} entities on {workers} core(s)", flush=True)
     matched = 0
+    written = 0
     with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
         handle.write("source1_entity_id\tmatched_entity_ids\n")
-        for eid, cands in iter_candidates(args.candidates):
-            chosen = score_candidates(booster, records, eid, cands, threshold) if cands else []
-            handle.write(eid + "\t" + ",".join(chosen) + "\n")
-            n += 1
-            matched += len(chosen)
-            if n % 50000 == 0:
-                print(f"  scored {n:,} entities, matches so far {matched:,}", flush=True)
-    print(f"Wrote {args.output}  entities={n:,}  matches={matched:,}", flush=True)
+        if workers == 1:
+            booster = lgb.Booster(model_file=args.model)
+            for eid, cands in iter_candidates(args.candidates):
+                chosen = score_candidates(booster, records, eid, cands, threshold) if cands else []
+                handle.write(eid + "\t" + ",".join(chosen) + "\n")
+                written += 1
+                matched += len(chosen)
+        else:
+            import multiprocessing as mp
+
+            step = (n_rows + workers - 1) // workers
+            spans = [(i, min(i + step, n_rows)) for i in range(0, n_rows, step)]
+            _PRED.clear()
+            _PRED.update(
+                candidates=args.candidates,
+                model=args.model,
+                records=records,
+                threshold=threshold,
+            )
+            ctx = mp.get_context("fork")
+            with ctx.Pool(len(spans)) as pool:
+                for part in pool.imap(_predict_span, spans):
+                    for eid, chosen in part:
+                        handle.write(eid + "\t" + ",".join(chosen) + "\n")
+                        written += 1
+                        matched += len(chosen)
+            _PRED.clear()
+    print(f"Wrote {args.output}  entities={written:,}  matches={matched:,}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:

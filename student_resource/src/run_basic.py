@@ -35,18 +35,22 @@ import train
 
 def run(args: argparse.Namespace) -> None:
     os.makedirs(args.output, exist_ok=True)
-    train_name = "sample_candidate_pairs.tsv" if args.train_sample else "train_candidate_pairs.tsv"
-    train_candidates = os.path.join(args.output, train_name)
+    train_candidates = os.path.join(args.output, "sample_candidate_pairs.tsv")
     test_candidates = os.path.join(args.output, "candidate_pairs.tsv")
     model_path = os.path.join(args.output, "matcher.txt")
     meta_path = os.path.join(args.output, "matcher_meta.json")
     matching_path = os.path.join(args.output, "matching_results.tsv")
 
-    if not os.path.exists(train_candidates):
-        mode = "sample" if args.train_sample else "full"
-        print(f"BLOCK TRAIN ({mode})", flush=True)
+    if args.model:
+        model_path = args.model
+        meta_path = args.meta
+        print(f"BLOCK TRAIN skipped. Using {model_path}", flush=True)
+    elif os.path.exists(model_path):
+        print(f"BLOCK TRAIN skipped. Using {model_path}", flush=True)
+    elif not os.path.exists(train_candidates):
+        print("BLOCK TRAIN (sample)", flush=True)
         blocking.run(Namespace(
-            mode=mode,
+            mode="sample",
             sample_size=args.sample_size,
             top_k=args.top_k,
             min_score=args.min_score,
@@ -57,7 +61,10 @@ def run(args: argparse.Namespace) -> None:
     else:
         print(f"BLOCK TRAIN skipped, using {train_candidates}", flush=True)
 
-    if not os.path.exists(model_path):
+    if args.model or os.path.exists(model_path):
+        if not args.model:
+            print(f"TRAIN skipped, using {model_path}", flush=True)
+    elif not os.path.exists(model_path):
         print("TRAIN", flush=True)
         train.run(Namespace(
             preprocessed=args.preprocessed,
@@ -143,6 +150,8 @@ def self_test() -> None:
         max_entities=10,
         neg_per_pos=2,
         seed=42,
+        model="",
+        meta="",
     ))
     matching = os.path.join(out, "matching_results.tsv")
     candidates = os.path.join(out, "candidate_pairs.tsv")
@@ -171,6 +180,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default="")
     p.add_argument("--train-sample", action="store_true", default=True)
     p.add_argument("--full-train-block", action="store_true")
+    p.add_argument("--model", default="")
+    p.add_argument("--meta", default="")
     p.add_argument("--sample-size", type=int, default=20000)
     p.add_argument("--top-k", type=int, default=200)
     p.add_argument("--min-score", type=float, default=1.0)
@@ -179,8 +190,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
-    if args.full_train_block:
-        args.train_sample = False
+    args.model = args.model.strip()
+    args.meta = args.meta.strip()
+    if args.model and not args.meta:
+        raise SystemExit("Pass --meta with --model")
     return args
 
 

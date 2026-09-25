@@ -135,6 +135,59 @@ class _Index:
         self.counts.clear()
 
 
+_SCORE: dict = {}
+
+
+def _score_span(bounds: tuple[int, int]) -> dict[str, list[str]]:
+    """Score a slice of Source-1 rows. Same keys and ranking as the one-core loop."""
+    start, end = bounds
+    s = _SCORE
+    s1_ids = s["s1_ids"]
+    s1_name = s["s1_name"]
+    s1_addr = s["s1_addr"]
+    s1_nums = s["s1_nums"]
+    specs = s["specs"]
+    c_ids = s["c_ids"]
+    exact_groups = s["exact_groups"]
+    exact_counts = s["exact_counts"]
+    cand_sig = s["cand_sig"]
+    cand_long = s["cand_long"]
+    top_k = s["top_k"]
+    min_score = s["min_score"]
+    out: dict[str, list[str]] = {}
+    for i in range(start, end):
+        scores: dict[int, float] = {}
+        words = _words(s1_name[i], 3)
+        addr_words = _words(s1_addr[i], 3)
+        nums = _all_numbers(s1_nums[i])
+        _hit(scores, specs["name"], words)
+        _hit(scores, specs["npair"], _pairs(words))
+        _hit(scores, specs["addr"], addr_words)
+        _hit(scores, specs["apair"], _pairs([w for w in addr_words if len(w) >= 4]))
+        _hit(scores, specs["num"], [t for t in nums if len(t) >= 3])
+        _hit(scores, specs["sig"], _signature(nums))
+        _hit(scores, specs["comp"], _composites(nums, addr_words))
+        pref = _prefix(words)
+        if pref:
+            _hit(scores, specs["pref"], [pref])
+        exact = " ".join(sorted(set(words))) if words else ""
+        group = exact_groups.get(exact, ())
+        if group:
+            qsig = _signature(nums)
+            qsig = qsig[0] if qsig else ""
+            qlong = {t for t in nums if len(t) >= 3}
+            df = exact_counts[exact]
+            for cid in group:
+                if df <= 80 or (qsig and cand_sig[cid] == qsig) or (qlong and qlong & cand_long[cid]):
+                    scores[cid] = scores.get(cid, 0.0) + 40.0
+        if not scores:
+            out[s1_ids[i]] = []
+        else:
+            ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            out[s1_ids[i]] = [c_ids[cid] for cid, sc in ranked[:top_k] if sc >= min_score]
+    return out
+
+
 def _hit(scores: dict[int, float], index: _Index, keys: list[str]) -> None:
     weight = index.weight
     postings = index.postings
@@ -241,47 +294,44 @@ def block_frames(
     del c_name, c_addr, c_nums
     gc.collect()
 
-    out: dict[str, list[str]] = {}
+    _SCORE.clear()
+    _SCORE.update(
+        s1_ids=s1_ids,
+        s1_name=s1_name,
+        s1_addr=s1_addr,
+        s1_nums=s1_nums,
+        specs=specs,
+        c_ids=c_ids,
+        exact_groups=exact_groups,
+        exact_counts=exact_counts,
+        cand_sig=cand_sig,
+        cand_long=cand_long,
+        top_k=top_k,
+        min_score=min_score,
+    )
+    n_s1 = len(s1_ids)
+    workers = 4 if os.name == "posix" and n_s1 >= 4000 else 1
+    spans = []
+    if workers == 1:
+        spans = [(0, n_s1)]
+    else:
+        step = (n_s1 + workers - 1) // workers
+        spans = [(i, min(i + step, n_s1)) for i in range(0, n_s1, step)]
+    print(f"      scoring {n_s1:,} rows on {len(spans)} core(s)", flush=True)
     t0 = time.time()
-    report_every = 100_000
-    for i, eid in enumerate(s1_ids):
-        scores: dict[int, float] = {}
-        words = _words(s1_name[i], 3)
-        addr_words = _words(s1_addr[i], 3)
-        nums = _all_numbers(s1_nums[i])
-        _hit(scores, specs["name"], words)
-        _hit(scores, specs["npair"], _pairs(words))
-        _hit(scores, specs["addr"], addr_words)
-        _hit(scores, specs["apair"], _pairs([w for w in addr_words if len(w) >= 4]))
-        _hit(scores, specs["num"], [t for t in nums if len(t) >= 3])
-        _hit(scores, specs["sig"], _signature(nums))
-        _hit(scores, specs["comp"], _composites(nums, addr_words))
-        pref = _prefix(words)
-        if pref:
-            _hit(scores, specs["pref"], [pref])
-        exact = " ".join(sorted(set(words))) if words else ""
-        group = exact_groups.get(exact, ())
-        if group:
-            qsig = _signature(nums)
-            qsig = qsig[0] if qsig else ""
-            qlong = {t for t in nums if len(t) >= 3}
-            df = exact_counts[exact]
-            for cid in group:
-                if df <= 80 or (qsig and cand_sig[cid] == qsig) or (qlong and qlong & cand_long[cid]):
-                    scores[cid] = scores.get(cid, 0.0) + 40.0
+    out: dict[str, list[str]] = {}
+    if len(spans) == 1:
+        out = _score_span(spans[0])
+    else:
+        import multiprocessing as mp
 
-        if not scores:
-            out[eid] = []
-        else:
-            ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-            out[eid] = [c_ids[cid] for cid, sc in ranked[:top_k] if sc >= min_score]
-
-        if (i + 1) % report_every == 0 or i + 1 == len(s1_ids):
-            print(
-                f"      scored {i + 1:,}/{len(s1_ids):,} in {time.time() - t0:.0f}s",
-                flush=True,
-            )
-
+        ctx = mp.get_context("fork")
+        with ctx.Pool(len(spans)) as pool:
+            for part in pool.imap_unordered(_score_span, spans):
+                out.update(part)
+                print(f"      scored {len(out):,}/{n_s1:,} in {time.time() - t0:.0f}s", flush=True)
+    print(f"      scored {n_s1:,}/{n_s1:,} in {time.time() - t0:.0f}s", flush=True)
+    _SCORE.clear()
     return out
 
 
