@@ -1,0 +1,7 @@
+student_resource/dataset/
+student_resource/preprocessed/
+student_resource/output/
+**/*.parquet
+**/*.tsv
+**/__pycache__/
+**/*.pyc

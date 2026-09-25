@@ -1,0 +1,5 @@
+numpy
+pandas
+pyarrow
+lightgbm
+rapidfuzz
