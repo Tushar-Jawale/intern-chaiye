@@ -5,3 +5,8 @@ student_resource/output/
 **/*.tsv
 **/__pycache__/
 **/*.pyc
+student_resource/work*/
+**/catboost_info/
+*.zip
+__MACOSX/
+**/.DS_Store
