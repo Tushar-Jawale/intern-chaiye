@@ -1,33 +1,22 @@
 """
 Phase 2 — Blocking / candidate generation.
 
-Measured on 4,000 true train pairs:
-  same country                         100%
-  shared name word or address number    90.5%
-  typo-only (character n-grams)          4.8%
+Measured on the full train split (2.2M Source-1 rows, 10.3M candidates):
+  candidate recall 0.951 overall (India 0.910, US 0.978) at top_k=200.
 
-Each country is blocked with inverted indexes on name words, name-word pairs,
-address words, address-word pairs, and address numbers. Character n-grams are
-not built. On the 20k sample almost every row already fills the top-200 list,
-so a second pass on empty rows does not reach the pairs that were missed.
+Each country label found in the data is blocked separately (France on test is
+just another label). Keys per record: name words, name-word pairs, address
+words, address-word pairs, 3+-digit numbers, the whole address-number set,
+number|place composites, a 5-letter name prefix, and the exact sorted name.
+A key is kept only when it is shared by at most max_df candidates. Score is
+the sum of IDF weights of shared keys; each Source-1 row keeps the top-K.
 
-A key is stored only when it is shared by at most max_df candidates, so common
-words never become a giant posting list. Each Source-1 row keeps the top-K
-candidates by IDF score. That list is the matcher input and the
-candidate_pairs.tsv row.
+Scoring is a sparse matrix product (Source-1 keys x candidate keys), computed
+in chunks of Source-1 rows with scipy. Same keys and weights as the earlier
+Python posting-list loop, which took ~4 hours per split on one core.
 
-No extra packages. In a Kaggle notebook, paste this file into one cell, delete
-the ``if __name__ == "__main__"`` block at the bottom, run the cell, then:
-
-    from argparse import Namespace
-    import glob, os
-    hits = glob.glob("/kaggle/input/**/train_s1.parquet", recursive=True)
-    args = Namespace(
-        mode="full", sample_size=20000, top_k=200, min_score=1.0,
-        country="", preprocessed=os.path.dirname(hits[0]),
-        output="/kaggle/working/output",
-    )
-    run(args)
+    python src/blocking.py --mode sample --sample-size 100000   # train sample + recall
+    python src/blocking.py --mode test                          # candidate_pairs.tsv
 """
 from __future__ import annotations
 
@@ -37,9 +26,11 @@ import glob
 import math
 import os
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 
+import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 COLS = [
     "entity_id",
@@ -105,98 +96,83 @@ def _idf(df: int, n: int) -> float:
     return math.log((n + 1) / df)
 
 
-class _Index:
-    def __init__(self, n_cands: int, max_df: int, base: float):
-        self.n = n_cands
-        self.max_df = max_df
-        self.base = base
-        self.counts: Counter = Counter()
-        self.postings: dict[str, list[int]] = {}
-        self.weight: dict[str, float] = {}
-
-    def observe(self, keys: list[str]) -> None:
-        if keys:
-            self.counts.update(set(keys))
-
-    def freeze(self) -> None:
-        keep = {k for k, c in self.counts.items() if 1 <= c <= self.max_df}
-        self.postings = {k: [] for k in keep}
-        self.weight = {k: self.base * _idf(self.counts[k], self.n) for k in keep}
-        self._keep = keep
-
-    def add(self, i: int, keys: list[str]) -> None:
-        keep = self._keep
-        postings = self.postings
-        for k in set(keys):
-            if k in keep:
-                postings[k].append(i)
-
-    def release_counts(self) -> None:
-        self.counts.clear()
+# kind -> (max_df, weight multiplier). Common single words are not keys by
+# themselves; they survive inside a pair, which is rare.
+_SPECS = {
+    "name": (1500, 1.0),
+    "npair": (8000, 2.4),
+    "addr": (1500, 0.9),
+    "apair": (4000, 2.0),
+    "num": (800, 1.2),
+    "sig": (200, 2.8),
+    "comp": (500, 2.2),
+    "pref": (300, 0.8),
+}
+_EXACT_BONUS = 40.0
+_EXACT_MAX_GROUP = 400
+_EXACT_SMALL_GROUP = 80
 
 
-_SCORE: dict = {}
+def record_keys(name: str, addr: str, nums_text: str) -> dict[str, list[str]]:
+    """All blocking keys of one record, grouped by kind. Same on both sides."""
+    words = _words(name, 3)
+    addr_words = _words(addr, 3)
+    nums = _all_numbers(nums_text)
+    pref = _prefix(words)
+    return {
+        "name": words,
+        "npair": _pairs(words),
+        "addr": addr_words,
+        "apair": _pairs([w for w in addr_words if len(w) >= 4]),
+        "num": [t for t in nums if len(t) >= 3],
+        "sig": _signature(nums),
+        "comp": _composites(nums, addr_words),
+        "pref": [pref] if pref else [],
+        "exact": [" ".join(sorted(set(words)))] if words else [],
+    }
 
 
-def _score_span(bounds: tuple[int, int]) -> dict[str, list[str]]:
-    """Score a slice of Source-1 rows. Same keys and ranking as the one-core loop."""
-    start, end = bounds
-    s = _SCORE
-    s1_ids = s["s1_ids"]
-    s1_name = s["s1_name"]
-    s1_addr = s["s1_addr"]
-    s1_nums = s["s1_nums"]
-    specs = s["specs"]
-    c_ids = s["c_ids"]
-    exact_groups = s["exact_groups"]
-    exact_counts = s["exact_counts"]
-    cand_sig = s["cand_sig"]
-    cand_long = s["cand_long"]
-    top_k = s["top_k"]
-    min_score = s["min_score"]
-    out: dict[str, list[str]] = {}
-    for i in range(start, end):
-        scores: dict[int, float] = {}
-        words = _words(s1_name[i], 3)
-        addr_words = _words(s1_addr[i], 3)
-        nums = _all_numbers(s1_nums[i])
-        _hit(scores, specs["name"], words)
-        _hit(scores, specs["npair"], _pairs(words))
-        _hit(scores, specs["addr"], addr_words)
-        _hit(scores, specs["apair"], _pairs([w for w in addr_words if len(w) >= 4]))
-        _hit(scores, specs["num"], [t for t in nums if len(t) >= 3])
-        _hit(scores, specs["sig"], _signature(nums))
-        _hit(scores, specs["comp"], _composites(nums, addr_words))
-        pref = _prefix(words)
-        if pref:
-            _hit(scores, specs["pref"], [pref])
-        exact = " ".join(sorted(set(words))) if words else ""
-        group = exact_groups.get(exact, ())
-        if group:
-            qsig = _signature(nums)
-            qsig = qsig[0] if qsig else ""
-            qlong = {t for t in nums if len(t) >= 3}
-            df = exact_counts[exact]
-            for cid in group:
-                if df <= 80 or (qsig and cand_sig[cid] == qsig) or (qlong and qlong & cand_long[cid]):
-                    scores[cid] = scores.get(cid, 0.0) + 40.0
-        if not scores:
-            out[s1_ids[i]] = []
-        else:
-            ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-            out[s1_ids[i]] = [c_ids[cid] for cid, sc in ranked[:top_k] if sc >= min_score]
+def _exact_keys(exact: str, sig: list[str], long_nums: list[str], df: int) -> list[str]:
+    """Exact sorted-name bonus. Small groups match outright; large groups only
+    when the address numbers agree (whole set, or a shared 3+-digit number)."""
+    if not exact or df == 0 or df > _EXACT_MAX_GROUP:
+        return []
+    if df <= _EXACT_SMALL_GROUP:
+        return ["ex|" + exact]
+    keys = []
+    if sig:
+        keys.append("exs|" + exact + "|" + sig[0])
+    for t in long_nums:
+        keys.append("exn|" + exact + "|" + t)
+    return keys
+
+
+def _topk_rows(scores: sp.csr_matrix, top_k: int, min_score: float) -> list[np.ndarray]:
+    """Per row: column ids of the top_k largest scores >= min_score, best first."""
+    out = []
+    indptr, indices, data = scores.indptr, scores.indices, scores.data
+    for r in range(scores.shape[0]):
+        a, b = indptr[r], indptr[r + 1]
+        if a == b:
+            out.append(np.empty(0, dtype=np.int64))
+            continue
+        d = data[a:b]
+        idx = indices[a:b]
+        if len(d) > top_k:
+            part = np.argpartition(-d, top_k - 1)[:top_k]
+            d, idx = d[part], idx[part]
+        order = np.argsort(-d, kind="stable")
+        d, idx = d[order], idx[order]
+        out.append(idx[d >= min_score])
     return out
 
 
-def _hit(scores: dict[int, float], index: _Index, keys: list[str]) -> None:
-    weight = index.weight
-    postings = index.postings
-    for k in set(keys):
-        w = weight.get(k)
-        if w is None:
-            continue
-        for cid in postings[k]:
-            scores[cid] = scores.get(cid, 0.0) + w
+def _coo_from_buffers(rows: list[int], cols: list[int], vals: list[float], shape: tuple[int, int]) -> sp.csr_matrix:
+    return sp.csr_matrix(
+        (np.asarray(vals, dtype=np.float32), (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
+        shape=shape,
+        dtype=np.float32,
+    )
 
 
 def block_frames(
@@ -204,6 +180,7 @@ def block_frames(
     cand: pd.DataFrame,
     top_k: int = 200,
     min_score: float = 1.0,
+    chunk: int = 2000,
 ) -> dict[str, list[str]]:
     """Block one country. Returns source1 id -> candidate ids, best first."""
     s1_ids = s1["entity_id"].tolist()
@@ -219,119 +196,121 @@ def block_frames(
     if n == 0 or len(s1_ids) == 0:
         return {eid: [] for eid in s1_ids}
 
-    name_keys: list[list[str]] = []
-    name_pair_keys: list[list[str]] = []
-    addr_keys: list[list[str]] = []
-    addr_pair_keys: list[list[str]] = []
-    num_keys: list[list[str]] = []
-    sig_keys: list[list[str]] = []
-    comp_keys: list[list[str]] = []
-    pref_keys: list[list[str]] = []
-    exact_keys: list[str] = []
-    cand_sig: list[str] = []
-    cand_long: list[set[str]] = []
-
-    for i in range(n):
-        words = _words(c_name[i], 3)
-        addr_words = _words(c_addr[i], 3)
-        addr_pair_src = [w for w in addr_words if len(w) >= 4]
-        nums = _all_numbers(c_nums[i])
-        name_keys.append(words)
-        name_pair_keys.append(_pairs(words))
-        addr_keys.append(addr_words)
-        addr_pair_keys.append(_pairs(addr_pair_src))
-        num_keys.append([t for t in nums if len(t) >= 3])
-        sig = _signature(nums)
-        sig_keys.append(sig)
-        comp_keys.append(_composites(nums, addr_words))
-        pref = _prefix(words)
-        pref_keys.append([pref] if pref else [])
-        exact_keys.append(" ".join(sorted(set(words))) if words else "")
-        cand_sig.append(sig[0] if sig else "")
-        cand_long.append({t for t in nums if len(t) >= 3})
-
-    # Single-word caps stay under top_k. Common words are not a blocking key
-    # by themselves; they survive inside a pair, which is rare.
-    specs = {
-        "name": _Index(n, 1500, 1.0),
-        "npair": _Index(n, 8000, 2.4),
-        "addr": _Index(n, 1500, 0.9),
-        "apair": _Index(n, 4000, 2.0),
-        "num": _Index(n, 800, 1.2),
-        "sig": _Index(n, 200, 2.8),
-        "comp": _Index(n, 500, 2.2),
-        "pref": _Index(n, 300, 0.8),
-    }
-    rows = {
-        "name": name_keys,
-        "npair": name_pair_keys,
-        "addr": addr_keys,
-        "apair": addr_pair_keys,
-        "num": num_keys,
-        "sig": sig_keys,
-        "comp": comp_keys,
-        "pref": pref_keys,
-    }
+    # Pass 1: document frequencies per kind (candidate side only, label-free).
+    t0 = time.time()
     print(f"      counting keys on {n:,} candidates", flush=True)
-    for kind, index in specs.items():
-        for keys in rows[kind]:
-            index.observe(keys)
-        index.freeze()
-    print("      filling indexes", flush=True)
-    for kind, index in specs.items():
-        for i, keys in enumerate(rows[kind]):
-            index.add(i, keys)
-        index.release_counts()
+    counts: dict[str, Counter] = {k: Counter() for k in _SPECS}
+    exact_counts: Counter = Counter()
+    for i in range(n):
+        ks = record_keys(c_name[i], c_addr[i], c_nums[i])
+        for kind in _SPECS:
+            if ks[kind]:
+                counts[kind].update(set(ks[kind]))
+        if ks["exact"]:
+            exact_counts[ks["exact"][0]] += 1
 
-    exact_counts = Counter(k for k in exact_keys if k)
-    exact_groups: dict[str, list[int]] = defaultdict(list)
-    for i, key in enumerate(exact_keys):
-        if key and exact_counts[key] <= 400:
-            exact_groups[key].append(i)
-
-    del name_keys, name_pair_keys, addr_keys, addr_pair_keys
-    del num_keys, sig_keys, comp_keys, pref_keys, exact_keys
-    del c_name, c_addr, c_nums
+    col: dict[str, int] = {}
+    weights: list[float] = []
+    for kind, (max_df, base) in _SPECS.items():
+        for key, c in counts[kind].items():
+            if 1 <= c <= max_df:
+                col[kind + "|" + key] = len(weights)
+                weights.append(base * _idf(c, n))
+    del counts
     gc.collect()
 
-    _SCORE.clear()
-    _SCORE.update(
-        s1_ids=s1_ids,
-        s1_name=s1_name,
-        s1_addr=s1_addr,
-        s1_nums=s1_nums,
-        specs=specs,
-        c_ids=c_ids,
-        exact_groups=exact_groups,
-        exact_counts=exact_counts,
-        cand_sig=cand_sig,
-        cand_long=cand_long,
-        top_k=top_k,
-        min_score=min_score,
-    )
-    n_s1 = len(s1_ids)
-    workers = 4 if os.name == "posix" and n_s1 >= 4000 else 1
-    spans = []
-    if workers == 1:
-        spans = [(0, n_s1)]
-    else:
-        step = (n_s1 + workers - 1) // workers
-        spans = [(i, min(i + step, n_s1)) for i in range(0, n_s1, step)]
-    print(f"      scoring {n_s1:,} rows on {len(spans)} core(s)", flush=True)
-    t0 = time.time()
-    out: dict[str, list[str]] = {}
-    if len(spans) == 1:
-        out = _score_span(spans[0])
-    else:
-        import multiprocessing as mp
+    # Pass 2: candidate matrix (rows = candidates, cols = keys, value = weight).
+    print(f"      building candidate matrix ({len(col):,} keys) at {time.time() - t0:.0f}s", flush=True)
+    exact_col: dict[str, int] = {}
+    buf_r: list[int] = []
+    buf_c: list[int] = []
+    buf_v: list[float] = []
+    arr_r: list[np.ndarray] = []
+    arr_c: list[np.ndarray] = []
+    arr_v: list[np.ndarray] = []
+    n_base = len(weights)
 
-        ctx = mp.get_context("fork")
-        with ctx.Pool(len(spans)) as pool:
-            for part in pool.imap_unordered(_score_span, spans):
-                out.update(part)
-                print(f"      scored {len(out):,}/{n_s1:,} in {time.time() - t0:.0f}s", flush=True)
-    print(f"      scored {n_s1:,}/{n_s1:,} in {time.time() - t0:.0f}s", flush=True)
-    _SCORE.clear()
+    def flush_buffers() -> None:
+        if buf_r:
+            arr_r.append(np.asarray(buf_r, dtype=np.int32))
+            arr_c.append(np.asarray(buf_c, dtype=np.int32))
+            arr_v.append(np.asarray(buf_v, dtype=np.float32))
+            buf_r.clear()
+            buf_c.clear()
+            buf_v.clear()
+
+    for i in range(n):
+        ks = record_keys(c_name[i], c_addr[i], c_nums[i])
+        seen: set[int] = set()
+        for kind in _SPECS:
+            for key in ks[kind]:
+                j = col.get(kind + "|" + key)
+                if j is not None and j not in seen:
+                    seen.add(j)
+                    buf_r.append(i)
+                    buf_c.append(j)
+                    buf_v.append(weights[j])
+        if ks["exact"]:
+            ex = ks["exact"][0]
+            for key in _exact_keys(ex, ks["sig"], ks["num"], exact_counts[ex]):
+                j = exact_col.get(key)
+                if j is None:
+                    j = n_base + len(exact_col)
+                    exact_col[key] = j
+                buf_r.append(i)
+                buf_c.append(j)
+                buf_v.append(_EXACT_BONUS)
+        if len(buf_r) >= 2_000_000:
+            flush_buffers()
+    flush_buffers()
+    del c_name, c_addr, c_nums
+    n_cols = n_base + len(exact_col)
+    rows_a = np.concatenate(arr_r)
+    cols_a = np.concatenate(arr_c)
+    vals_a = np.concatenate(arr_v)
+    del arr_r, arr_c, arr_v
+    # keys x candidates, built directly in the orientation used for scoring
+    cand_t = sp.csr_matrix((vals_a, (cols_a, rows_a)), shape=(n_cols, n), dtype=np.float32)
+    del rows_a, cols_a, vals_a
+    gc.collect()
+    print(f"      matrix nnz={cand_t.nnz:,} at {time.time() - t0:.0f}s", flush=True)
+
+    # Pass 3: score Source-1 rows in chunks. Query matrix is binary.
+    n_s1 = len(s1_ids)
+    out: dict[str, list[str]] = {}
+    t1 = time.time()
+    n_chunks = (n_s1 + chunk - 1) // chunk
+    for ci, start in enumerate(range(0, n_s1, chunk)):
+        end = min(start + chunk, n_s1)
+        q_r: list[int] = []
+        q_c: list[int] = []
+        for r, i in enumerate(range(start, end)):
+            ks = record_keys(s1_name[i], s1_addr[i], s1_nums[i])
+            seen = set()
+            for kind in _SPECS:
+                for key in ks[kind]:
+                    j = col.get(kind + "|" + key)
+                    if j is not None and j not in seen:
+                        seen.add(j)
+                        q_r.append(r)
+                        q_c.append(j)
+            if ks["exact"]:
+                ex = ks["exact"][0]
+                for key in _exact_keys(ex, ks["sig"], ks["num"], exact_counts.get(ex, 0)):
+                    j = exact_col.get(key)
+                    if j is not None and j not in seen:
+                        seen.add(j)
+                        q_r.append(r)
+                        q_c.append(j)
+        q = _coo_from_buffers(q_r, q_c, [1.0] * len(q_r), (end - start, n_cols))
+        scores = (q @ cand_t).tocsr()
+        for r, cols in enumerate(_topk_rows(scores, top_k, min_score)):
+            out[s1_ids[start + r]] = [c_ids[j] for j in cols.tolist()]
+        del q, scores
+        if (ci + 1) % 25 == 0 or end == n_s1:
+            print(f"      scored {end:,}/{n_s1:,} in {time.time() - t1:.0f}s", flush=True)
+    del cand_t
+    gc.collect()
     return out
 
 
@@ -383,30 +362,44 @@ def load_split(preprocessed: str, split: str) -> tuple[pd.DataFrame, pd.DataFram
     return s1, pd.concat([s2, s3], ignore_index=True), gt
 
 
-def recall_against(candidates: dict[str, list[str]], gt: pd.DataFrame) -> tuple[int, int, list]:
+def recall_against(candidates: dict[str, list[str]], gt: pd.DataFrame) -> tuple[int, int, list, Counter]:
+    """Pair recall plus a histogram of the rank at which true matches were found."""
     found = 0
     total = 0
     missed = []
-    id_set = {k: set(v) for k, v in candidates.items()}
+    ranks: Counter = Counter()
+    pos_of = {k: {c: i for i, c in enumerate(v)} for k, v in candidates.items()}
     for s1_id, matched in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
-        if s1_id not in id_set:
+        if s1_id not in pos_of:
             continue
         if matched is None or (isinstance(matched, float) and pd.isna(matched)):
             continue
         text = str(matched).strip()
         if not text or text == "nan":
             continue
-        got = id_set[s1_id]
+        got = pos_of[s1_id]
         for mid in text.split(","):
             mid = mid.strip()
             if not mid:
                 continue
             total += 1
-            if mid in got:
+            r = got.get(mid)
+            if r is not None:
                 found += 1
+                ranks["<10" if r < 10 else "<25" if r < 25 else "<50" if r < 50 else "<100" if r < 100 else ">=100"] += 1
             elif len(missed) < 15:
                 missed.append((s1_id, mid))
-    return found, total, missed
+    return found, total, missed, ranks
+
+
+def candidate_stats(rows: dict[str, list[str]], top_k: int) -> str:
+    sizes = np.fromiter((len(v) for v in rows.values()), dtype=np.int64, count=len(rows))
+    if len(sizes) == 0:
+        return "no rows"
+    return (
+        f"avg={sizes.mean():.1f} median={np.median(sizes):.0f} zero={(sizes == 0).sum():,} "
+        f"at_top_k={(sizes >= top_k).mean():.3f}"
+    )
 
 
 def write_tsv(path: str, rows: dict[str, list[str]], ordered_ids: list[str]) -> None:
@@ -427,6 +420,7 @@ def run(args: argparse.Namespace) -> None:
     preprocessed = find_preprocessed(args.preprocessed)
     out_dir = args.output or default_output()
     split = "test" if args.mode == "test" else "train"
+    chunk = getattr(args, "chunk", 2000) or 2000
     print(f"Preprocessed: {preprocessed}", flush=True)
     print(f"Output:       {out_dir}", flush=True)
     t_load = time.time()
@@ -448,6 +442,7 @@ def run(args: argparse.Namespace) -> None:
     all_rows: dict[str, list[str]] = {}
     found = total = 0
     missed_all = []
+    ranks_all: Counter = Counter()
     t0 = time.time()
     for country in countries:
         s1_c = s1[s1["country"] == country].reset_index(drop=True)
@@ -459,22 +454,21 @@ def run(args: argparse.Namespace) -> None:
         if len(s1_c) == 0:
             continue
         t_c = time.time()
-        blocked = block_frames(s1_c, cand_c, top_k=args.top_k, min_score=args.min_score)
+        blocked = block_frames(s1_c, cand_c, top_k=args.top_k, min_score=args.min_score, chunk=chunk)
         all_rows.update(blocked)
-        n_pairs = sum(len(v) for v in blocked.values())
         print(
-            f"  {country} done in {time.time() - t_c:.0f}s, pairs={n_pairs:,}, "
-            f"avg={n_pairs / max(len(blocked), 1):.1f}",
+            f"  {country} done in {time.time() - t_c:.0f}s, candidates/entity {candidate_stats(blocked, args.top_k)}",
             flush=True,
         )
         if gt is not None:
             sub = gt[gt["source1_entity_id"].isin(set(blocked))]
-            fnd, tot, missed = recall_against(blocked, sub)
+            fnd, tot, missed, ranks = recall_against(blocked, sub)
             found += fnd
             total += tot
+            ranks_all.update(ranks)
             missed_all.extend(missed[:10])
             if tot:
-                print(f"  recall so far: {found / total:.4f} ({found:,}/{total:,})", flush=True)
+                print(f"  {country} recall: {fnd / tot:.4f} ({fnd:,}/{tot:,})", flush=True)
         del s1_c, cand_c, blocked
         gc.collect()
 
@@ -482,16 +476,15 @@ def run(args: argparse.Namespace) -> None:
         all_rows.setdefault(eid, [])
 
     n_pairs = sum(len(v) for v in all_rows.values())
-    n_with = sum(1 for v in all_rows.values() if v)
     possible = len(s1) * max(len(cand), 1)
     print(
-        f"\nPairs={n_pairs:,}  with_candidates={n_with:,}/{len(all_rows):,}  "
-        f"avg={n_pairs / max(len(all_rows), 1):.1f}  "
+        f"\nPairs={n_pairs:,}  {candidate_stats(all_rows, args.top_k)}  "
         f"reduction={1 - n_pairs / possible:.6%}  time={time.time() - t0:.0f}s",
         flush=True,
     )
     if total:
         print(f"BLOCKING RECALL: {found / total:.4f} ({found:,}/{total:,})", flush=True)
+        print(f"  rank of found true matches: {dict(sorted(ranks_all.items()))}", flush=True)
         for s1_id, mid in missed_all[:8]:
             print(f"  missed {s1_id} -> {mid}", flush=True)
 
@@ -514,7 +507,6 @@ def self_test() -> None:
                 "entity_id": "S1-a",
                 "country": "US",
                 "name_core": "alpha beta",
-                "name_normalized": "alpha beta llc",
                 "addr_normalized": "100 oak street austin tx",
                 "addr_numbers": "100",
             },
@@ -522,7 +514,6 @@ def self_test() -> None:
                 "entity_id": "S1-b",
                 "country": "US",
                 "name_core": "westchester market",
-                "name_normalized": "westchester market",
                 "addr_normalized": "551 pine road dallas tx",
                 "addr_numbers": "551",
             },
@@ -530,7 +521,6 @@ def self_test() -> None:
                 "entity_id": "S1-c",
                 "country": "US",
                 "name_core": "totally different",
-                "name_normalized": "totally different",
                 "addr_normalized": "900 lakeside drive miami fl",
                 "addr_numbers": "900",
             },
@@ -538,7 +528,6 @@ def self_test() -> None:
                 "entity_id": "S1-d",
                 "country": "India",
                 "name_core": "raj investments",
-                "name_normalized": "raj investments",
                 "addr_normalized": "6 29 colony main road mylapore chennai",
                 "addr_numbers": "6 29 2",
             },
@@ -550,7 +539,6 @@ def self_test() -> None:
                 "entity_id": "S2-a",
                 "country": "US",
                 "name_core": "beta alpha",
-                "name_normalized": "beta alpha",
                 "addr_normalized": "100 oak street austin tx",
                 "addr_numbers": "100",
             },
@@ -558,7 +546,6 @@ def self_test() -> None:
                 "entity_id": "S2-b",
                 "country": "US",
                 "name_core": "westcheter market",
-                "name_normalized": "westcheter market",
                 "addr_normalized": "551 pine road dallas tx",
                 "addr_numbers": "551",
             },
@@ -566,7 +553,6 @@ def self_test() -> None:
                 "entity_id": "S3-c",
                 "country": "US",
                 "name_core": "unrelated trading",
-                "name_normalized": "unrelated trading",
                 "addr_normalized": "900 lakeside drive miami fl",
                 "addr_numbers": "900",
             },
@@ -574,7 +560,6 @@ def self_test() -> None:
                 "entity_id": "S2-z",
                 "country": "US",
                 "name_core": "other shop",
-                "name_normalized": "other shop",
                 "addr_normalized": "1 main street boston ma",
                 "addr_numbers": "1",
             },
@@ -582,13 +567,12 @@ def self_test() -> None:
                 "entity_id": "S2-d",
                 "country": "India",
                 "name_core": "raj invesdhmendhs elelbhi",
-                "name_normalized": "raj invesdhmendhs elelbhi",
                 "addr_normalized": "6 29 colony main road mylapore chennai",
                 "addr_numbers": "6 29 2",
             },
         ]
     )
-    got = block_frames(s1, cand, top_k=5, min_score=1.0)
+    got = block_frames(s1, cand, top_k=5, min_score=1.0, chunk=3)
     assert "S2-a" in got["S1-a"], f"word-reorder miss: {got}"
     assert "S2-b" in got["S1-b"], f"typo+shared-word miss: {got}"
     assert "S3-c" in got["S1-c"], f"addr-only miss: {got}"
@@ -600,9 +584,10 @@ def self_test() -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Blocking / candidate generation")
     p.add_argument("--mode", choices=["sample", "full", "test", "self-test"], default="sample")
-    p.add_argument("--sample-size", type=int, default=20000)
+    p.add_argument("--sample-size", type=int, default=100000)
     p.add_argument("--top-k", type=int, default=200)
     p.add_argument("--min-score", type=float, default=1.0)
+    p.add_argument("--chunk", type=int, default=2000, help="Source-1 rows scored per sparse product")
     p.add_argument("--country", default="", help="Run a single country label, e.g. US")
     p.add_argument("--preprocessed", default="", help="Folder with *_s1.parquet files")
     p.add_argument("--output", default="", help="Output directory")

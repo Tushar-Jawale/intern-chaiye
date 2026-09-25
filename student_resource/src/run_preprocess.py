@@ -23,9 +23,14 @@ from preprocess import (
     extract_numbers
 )
 
-BASE = r"f:\TECH\ML challenge\student_resource\dataset"
-OUTPUT = r"f:\TECH\ML challenge\student_resource\preprocessed"
-os.makedirs(OUTPUT, exist_ok=True)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.environ.get("DATASET_DIR", os.path.join(_HERE, "..", "dataset"))
+OUTPUT = os.environ.get("PREPROCESSED_DIR", os.path.join(_HERE, "..", "preprocessed"))
+
+# Transliteration is part of the pipeline, not optional: without these the
+# Indic-script names silently stay untransliterated and outputs change.
+import indic_transliteration  # noqa: F401
+import unidecode  # noqa: F401
 
 
 def fast_clean_text(series: pd.Series) -> pd.Series:
@@ -179,6 +184,12 @@ def preprocess_dataframe_fast(df: pd.DataFrame, n_workers: int = None) -> pd.Dat
 
 
 if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        BASE = sys.argv[1]
+    if len(sys.argv) > 2:
+        OUTPUT = sys.argv[2]
+    os.makedirs(OUTPUT, exist_ok=True)
+    print(f"dataset: {BASE}\npreprocessed: {OUTPUT}")
     FILES = [
         ("train", "train_source1.tsv", "train_s1"),
         ("train", "train_source2.tsv", "train_s2"),

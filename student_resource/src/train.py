@@ -2,26 +2,17 @@
 Phase 4 — Train the matcher on blocking candidates.
 
 Labels come from train ground truth. A candidate that is a true match is a
-positive. Every other candidate of that entity is a hard negative. Entities
-are split before any feature is computed.
+positive. Every other candidate of that entity is a hard negative. By default
+ALL candidates of the training entities are used (neg_per_pos=0) with no class
+weighting, so predicted probabilities live on the same scale the model sees at
+inference (about 1 positive per 60 candidates).
 
-The decision threshold maximises macro F0.5 on the validation entities,
-including singletons. That is the leaderboard metric.
+Entities are split three ways before any feature is computed:
+  fit        -> model training
+  threshold  -> pick the decision threshold that maximises macro F0.5
+  report     -> the number we quote (never used for fitting or tuning)
 
-Kaggle, after the sample candidate file exists:
-
-    from argparse import Namespace
-    import glob, os
-    hits = glob.glob("/kaggle/input/**/train_s1.parquet", recursive=True)
-    args = Namespace(
-        preprocessed=os.path.dirname(hits[0]),
-        candidates="/kaggle/working/output/sample_candidate_pairs.tsv",
-        output="/kaggle/working/output",
-        max_entities=20000,
-        neg_per_pos=4,
-        seed=42,
-    )
-    run(args)
+    python src/train.py --preprocessed preprocessed --candidates output/sample_candidate_pairs.tsv --output output
 """
 from __future__ import annotations
 
@@ -141,7 +132,7 @@ def build_rows(
         truth = gold.get(eid) or set()
         left = records.get(eid, empty)
         chosen = []
-        if keep_all:
+        if keep_all or neg_per_pos <= 0:
             chosen = cands
         else:
             pos = [c for c in cands if c in truth]
@@ -173,17 +164,78 @@ def predictions_at(s1_ids: list[str], cand_ids: list[str], scores: np.ndarray, t
     return preds
 
 
-def best_threshold(s1_ids: list[str], cand_ids: list[str], scores: np.ndarray, gold: dict[str, set[str]]) -> tuple[float, float]:
+THRESHOLD_GRID = sorted(
+    set([round(float(t), 3) for t in np.linspace(0.30, 0.95, 27)])
+    | {0.96, 0.97, 0.975, 0.98, 0.985, 0.99, 0.993, 0.995, 0.997, 0.998, 0.999}
+)
+
+
+def entity_report(preds: dict[str, set[str]], gold: dict[str, set[str]], countries: dict[str, str] | None = None) -> dict:
+    """Macro F0.5 / precision / recall, plus F0.5 by true-match count and country."""
+    f_sum = p_sum = r_sum = 0.0
+    groups: dict[str, list[float]] = {}
+    singleton_fp = singleton_n = 0
+    for eid, truth in gold.items():
+        pred = preds.get(eid) or set()
+        if not truth:
+            singleton_n += 1
+            score = 1.0 if not pred else 0.0
+            singleton_fp += 1 if pred else 0
+            precision = recall = score
+        elif not pred:
+            score = precision = recall = 0.0
+        else:
+            hit = len(truth & pred)
+            precision = hit / len(pred)
+            recall = hit / len(truth)
+            score = (1.25 * precision * recall) / (0.25 * precision + recall) if hit else 0.0
+        f_sum += score
+        p_sum += precision
+        r_sum += recall
+        n_true = len(truth)
+        key = "matches=0" if n_true == 0 else "matches=1" if n_true == 1 else "matches=2-3" if n_true <= 3 else "matches=4+"
+        groups.setdefault(key, []).append(score)
+        if countries is not None:
+            groups.setdefault("country=" + str(countries.get(eid, "?")), []).append(score)
+    n = max(len(gold), 1)
+    return {
+        "macro_f05": f_sum / n,
+        "macro_precision": p_sum / n,
+        "macro_recall": r_sum / n,
+        "singleton_false_positive_rate": singleton_fp / max(singleton_n, 1),
+        "groups": {k: {"f05": float(np.mean(v)), "n": len(v)} for k, v in sorted(groups.items())},
+    }
+
+
+def best_threshold(s1_ids: list[str], cand_ids: list[str], scores: np.ndarray, gold: dict[str, set[str]]) -> tuple[float, float, list]:
     entities = {eid: gold.get(eid, set()) for eid in set(s1_ids)}
     best_t, best_f = 0.5, -1.0
-    for threshold in np.linspace(0.30, 0.95, 27):
+    curve = []
+    for threshold in THRESHOLD_GRID:
         preds = predictions_at(s1_ids, cand_ids, scores, float(threshold))
         for eid in entities:
             preds.setdefault(eid, set())
-        score = macro_f05(preds, entities)
-        if score > best_f:
-            best_t, best_f = float(threshold), score
-    return best_t, best_f
+        rep = entity_report(preds, entities)
+        curve.append((float(threshold), rep["macro_f05"], rep["macro_precision"], rep["macro_recall"]))
+        if rep["macro_f05"] > best_f:
+            best_t, best_f = float(threshold), rep["macro_f05"]
+    return best_t, best_f, curve
+
+
+def load_countries(preprocessed: str, entity_ids: set[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    path = os.path.join(preprocessed, "train_s1.parquet")
+    if not os.path.exists(path):
+        return out
+    pf = pq.ParquetFile(path)
+    if "country" not in pf.schema_arrow.names:
+        return out
+    for batch in pf.iter_batches(batch_size=250_000, columns=["entity_id", "country"]):
+        data = batch.to_pydict()
+        for eid, country in zip(data["entity_id"], data["country"]):
+            if eid in entity_ids:
+                out[eid] = country
+    return out
 
 
 def run(args: argparse.Namespace) -> None:
@@ -195,11 +247,14 @@ def run(args: argparse.Namespace) -> None:
     entity_ids = list(candidates)
     rng = random.Random(args.seed)
     rng.shuffle(entity_ids)
-    cut = max(1, int(len(entity_ids) * 0.8))
-    train_ids, val_ids = entity_ids[:cut], entity_ids[cut:]
-    print(f"  train entities {len(train_ids):,}  val entities {len(val_ids):,}", flush=True)
+    n_ent = len(entity_ids)
+    cut_fit = max(1, int(n_ent * 0.70))
+    cut_thr = max(cut_fit + 1, int(n_ent * 0.85))
+    fit_ids, thr_ids, rep_ids = entity_ids[:cut_fit], entity_ids[cut_fit:cut_thr], entity_ids[cut_thr:]
+    print(f"  fit entities {len(fit_ids):,}  threshold entities {len(thr_ids):,}  report entities {len(rep_ids):,}", flush=True)
 
     gold = load_gold(args.preprocessed, set(entity_ids))
+    countries = load_countries(args.preprocessed, set(entity_ids))
     need = set(entity_ids)
     for eid in entity_ids:
         need.update(candidates[eid])
@@ -208,42 +263,69 @@ def run(args: argparse.Namespace) -> None:
     records = load_records(args.preprocessed, need)
     print(f"  loaded {len(records):,} in {time.time() - t0:.0f}s", flush=True)
 
-    print("Building train pairs", flush=True)
-    x_train, y_train, _, _ = build_rows(
-        candidates, gold, records, train_ids, args.neg_per_pos, args.seed, keep_all=False
-    )
-    print(f"  train pairs {len(y_train):,}  positives {int(y_train.sum()):,}", flush=True)
-    print("Scoring every validation candidate", flush=True)
-    x_val, y_val, val_s1, val_cands = build_rows(
-        candidates, gold, records, val_ids, args.neg_per_pos, args.seed, keep_all=True
-    )
-    print(f"  val pairs {len(y_val):,}  positives {int(y_val.sum()):,}", flush=True)
-    if len(y_train) == 0 or len(y_val) == 0:
+    print("Building fit pairs", flush=True)
+    x_fit, y_fit, _, _ = build_rows(candidates, gold, records, fit_ids, args.neg_per_pos, args.seed, keep_all=False)
+    print(f"  fit pairs {len(y_fit):,}  positives {int(y_fit.sum()):,}  ({y_fit.mean() if len(y_fit) else 0:.4f})", flush=True)
+    x_thr, y_thr, thr_s1, thr_cands = build_rows(candidates, gold, records, thr_ids, 0, args.seed, keep_all=True)
+    x_rep, y_rep, rep_s1, rep_cands = build_rows(candidates, gold, records, rep_ids, 0, args.seed, keep_all=True)
+    print(f"  threshold pairs {len(y_thr):,}  report pairs {len(y_rep):,}", flush=True)
+    if len(y_fit) == 0 or len(y_thr) == 0 or len(y_rep) == 0:
         raise RuntimeError("No pairs built. Check the candidate file and preprocessed path.")
 
-    pos = max(int(y_train.sum()), 1)
-    neg = max(len(y_train) - pos, 1)
+    pos = max(int(y_fit.sum()), 1)
+    neg = max(len(y_fit) - pos, 1)
+    scale_pos_weight = (neg / pos) if args.class_weight else 1.0
     model = lgb.LGBMClassifier(
         objective="binary",
-        n_estimators=400,
+        n_estimators=args.n_estimators,
         learning_rate=0.05,
         num_leaves=63,
         min_child_samples=40,
         subsample=0.8,
+        subsample_freq=1,
         colsample_bytree=0.8,
-        scale_pos_weight=neg / pos,
+        scale_pos_weight=scale_pos_weight,
         random_state=args.seed,
         n_jobs=-1,
         verbose=-1,
     )
-    model.fit(x_train, y_train, eval_set=[(x_val, y_val)], eval_metric="binary_logloss")
-    val_scores = model.predict_proba(x_val)[:, 1]
-    threshold, f05 = best_threshold(val_s1, val_cands, val_scores, gold)
-    print(f"VAL MACRO F0.5: {f05:.4f} at threshold {threshold:.3f}", flush=True)
+    model.fit(x_fit, y_fit)
+
+    thr_scores = model.predict_proba(x_thr)[:, 1]
+    threshold, f05_thr, curve = best_threshold(thr_s1, thr_cands, thr_scores, gold)
+    print("Threshold sweep (threshold split): thr  F0.5  P  R", flush=True)
+    for t, f, p, r in curve:
+        marker = " <- best" if t == threshold else ""
+        print(f"  {t:.3f}  {f:.4f}  {p:.4f}  {r:.4f}{marker}", flush=True)
+    if threshold >= max(THRESHOLD_GRID):
+        print("  WARNING: best threshold is the top of the grid; probabilities are still inflated.", flush=True)
+
+    rep_scores = model.predict_proba(x_rep)[:, 1]
+    rep_gold = {eid: gold.get(eid, set()) for eid in rep_ids}
+    rep_preds = predictions_at(rep_s1, rep_cands, rep_scores, threshold)
+    for eid in rep_ids:
+        rep_preds.setdefault(eid, set())
+    report = entity_report(rep_preds, rep_gold, countries)
+    print(f"REPORT MACRO F0.5: {report['macro_f05']:.4f}  P={report['macro_precision']:.4f}  R={report['macro_recall']:.4f}  "
+          f"singleton FP rate={report['singleton_false_positive_rate']:.3f}  at threshold {threshold:.3f}", flush=True)
+    for key, val in report["groups"].items():
+        print(f"  {key:14s} F0.5={val['f05']:.4f}  n={val['n']:,}", flush=True)
+    importance = sorted(zip(FEATURE_COLS, model.booster_.feature_importance("gain")), key=lambda kv: -kv[1])
+    print("  feature gain:", [(k, int(v)) for k, v in importance], flush=True)
 
     model_path = os.path.join(args.output, "matcher.txt")
     model.booster_.save_model(model_path)
-    meta = {"threshold": threshold, "val_macro_f05": f05, "features": FEATURE_COLS}
+    meta = {
+        "threshold": threshold,
+        "threshold_split_macro_f05": f05_thr,
+        "report_split": report,
+        "threshold_curve": curve,
+        "features": FEATURE_COLS,
+        "n_fit_entities": len(fit_ids),
+        "neg_per_pos": args.neg_per_pos,
+        "class_weight": bool(args.class_weight),
+        "seed": args.seed,
+    }
     with open(os.path.join(args.output, "matcher_meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2)
     print(f"Wrote {model_path}", flush=True)
@@ -254,8 +336,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preprocessed", required=True)
     p.add_argument("--candidates", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--max-entities", type=int, default=20000)
-    p.add_argument("--neg-per-pos", type=int, default=4)
+    p.add_argument("--max-entities", type=int, default=100000)
+    p.add_argument("--neg-per-pos", type=int, default=0, help="0 = use every candidate as a negative (default)")
+    p.add_argument("--class-weight", action="store_true", help="Re-enable scale_pos_weight (inflates probabilities)")
+    p.add_argument("--n-estimators", type=int, default=600)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 

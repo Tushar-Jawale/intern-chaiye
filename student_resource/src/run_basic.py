@@ -1,18 +1,14 @@
 """
-Basic model, end to end.
+End-to-end pipeline.
 
-  block train  ->  train matcher  ->  block test  ->  write both submission files
+  block train sample  ->  train matcher  ->  block test  ->  write both submission files
 
-Train blocking defaults to a 20,000-row sample, which is enough to fit the
-first model. Test blocking covers every test Source-1 entity. Re-running
-skips a step when its output file is already present.
+Train blocking scores a 100,000-row Source-1 sample against ALL train
+candidates (that is where blocking recall and the rank histogram are printed).
+Test blocking covers every test Source-1 entity. Re-running skips a step when
+its output file is already present; delete the file to redo the step.
 
-Kaggle, with this src folder uploaded and the preprocessed parquet dataset
-attached:
-
-    python src/run_basic.py ^
-        --preprocessed /kaggle/input/<dataset>/preprocessed ^
-        --output /kaggle/working/output
+    python src/run_basic.py --preprocessed preprocessed --output output
 
 `--self-test` runs the same four steps on a tiny in-memory dataset.
 """
@@ -72,6 +68,8 @@ def run(args: argparse.Namespace) -> None:
             output=args.output,
             max_entities=args.max_entities,
             neg_per_pos=args.neg_per_pos,
+            class_weight=False,
+            n_estimators=args.n_estimators,
             seed=args.seed,
         ))
     else:
@@ -143,12 +141,12 @@ def self_test() -> None:
     run(Namespace(
         preprocessed=pre,
         output=out,
-        train_sample=False,
         sample_size=10,
         top_k=20,
         min_score=0.0,
         max_entities=10,
-        neg_per_pos=2,
+        neg_per_pos=0,
+        n_estimators=50,
         seed=42,
         model="",
         meta="",
@@ -178,15 +176,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run the basic entity-resolution model")
     p.add_argument("--preprocessed", default="")
     p.add_argument("--output", default="")
-    p.add_argument("--train-sample", action="store_true", default=True)
-    p.add_argument("--full-train-block", action="store_true")
-    p.add_argument("--model", default="")
-    p.add_argument("--meta", default="")
-    p.add_argument("--sample-size", type=int, default=20000)
+    p.add_argument("--model", default="", help="Reuse a trained matcher.txt (skips train blocking + training)")
+    p.add_argument("--meta", default="", help="matcher_meta.json that goes with --model")
+    p.add_argument("--sample-size", type=int, default=100000, help="Source-1 rows blocked for training")
     p.add_argument("--top-k", type=int, default=200)
     p.add_argument("--min-score", type=float, default=1.0)
-    p.add_argument("--max-entities", type=int, default=20000)
-    p.add_argument("--neg-per-pos", type=int, default=4)
+    p.add_argument("--max-entities", type=int, default=100000, help="Entities used for fit/threshold/report")
+    p.add_argument("--neg-per-pos", type=int, default=0, help="0 = every candidate is a negative")
+    p.add_argument("--n-estimators", type=int, default=600)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args()
