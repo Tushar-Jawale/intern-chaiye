@@ -107,6 +107,81 @@ def pair_features(name1: str, addr1: str, nums1: str, name2: str, addr2: str, nu
     ]
 
 
+def prep_record(name: str, addr: str, nums: str) -> tuple:
+    """Per-record pieces of pair_features, computed once instead of per pair."""
+    name = name or ""
+    addr = addr or ""
+    return (
+        name,
+        addr,
+        _tokens(name),
+        _tokens(addr, 3),
+        _numbers(nums),
+        " ".join(sorted(name.split())),
+        " ".join(sorted(addr.split())),
+    )
+
+
+def _paired_ratio(a: list[str], b: list[str], workers: int) -> "np.ndarray":
+    import numpy as np
+
+    n = len(a)
+    if _token_sort_ratio is not None:
+        from rapidfuzz import fuzz, process
+
+        out = np.asarray(process.cpdist(a, b, scorer=fuzz.ratio, workers=workers, dtype=np.float32), dtype=np.float32) / 100.0
+    else:
+        out = np.fromiter((1.0 if x == y else 0.0 for x, y in zip(a, b)), dtype=np.float32, count=n)
+    empty = np.fromiter((not x or not y for x, y in zip(a, b)), dtype=bool, count=n)
+    out[empty] = 0.0
+    return out
+
+
+def batch_features(left: list[tuple], right: list[tuple], workers: int = 1) -> "np.ndarray":
+    """Same values as pair_features for each (left[i], right[i]) prepped pair."""
+    import numpy as np
+
+    n = len(left)
+    x = np.zeros((n, len(FEATURE_COLS)), dtype=np.float32)
+    if n == 0:
+        return x
+    x[:, 1] = _paired_ratio([p[5] if p[0] else "" for p in left], [q[5] if q[0] else "" for q in right], workers)
+    x[:, 5] = _paired_ratio([p[6] if p[1] else "" for p in left], [q[6] if q[1] else "" for q in right], workers)
+    for i in range(n):
+        p = left[i]
+        q = right[i]
+        n1, a1 = p[0], p[1]
+        n2, a2 = q[0], q[1]
+        nt1, at1, nu1 = p[2], p[3], p[4]
+        nt2, at2, nu2 = q[2], q[3], q[4]
+        row = x[i]
+        if nt1 and nt2:
+            inter = len(nt1 & nt2)
+            if inter:
+                row[0] = inter / (len(nt1) + len(nt2) - inter)
+        if n1 and n2:
+            l1, l2 = len(n1), len(n2)
+            row[2] = l1 / l2 if l1 <= l2 else l2 / l1
+            if l1 >= 4 and l2 >= 4 and (n1 in n2 or n2 in n1):
+                row[3] = 1.0
+        if at1 and at2:
+            inter = len(at1 & at2)
+            if inter:
+                row[4] = inter / (len(at1) + len(at2) - inter)
+        if a1 and a2:
+            l1, l2 = len(a1), len(a2)
+            row[6] = l1 / l2 if l1 <= l2 else l2 / l1
+        if nu1 and nu2:
+            inter = len(nu1 & nu2)
+            if inter:
+                row[7] = inter / (len(nu1) + len(nu2) - inter)
+            if nu1 == nu2:
+                row[8] = 1.0
+        if (nt1 and at2 and not nt1.isdisjoint(at2)) or (nt2 and at1 and not nt2.isdisjoint(at1)):
+            row[9] = 1.0
+    return x
+
+
 def macro_f05(preds: dict[str, set[str]], gold: dict[str, set[str]]) -> float:
     """Macro F0.5 over every entity in gold. Empty gold and empty pred scores 1."""
     if not gold:
