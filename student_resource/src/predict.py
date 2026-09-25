@@ -5,9 +5,13 @@ Every Source-1 row in the candidate file is written, including singletons.
 A match is kept only when its score is at least the trained F0.5 threshold,
 so the matched ids are always a subset of that row's candidates.
 
-Candidates are scored in batches (one booster call per ~200k pairs). On POSIX
-the file is split into contiguous spans, one per worker; each worker writes its
-own part file and reports progress, and the parts are concatenated in order.
+Candidates are scored in batches (one booster call per ~200k pairs).
+
+Memory: the candidate file is split into job files grouped by the Source-1
+country, and each job loads only the records its own rows reference. No
+process ever holds all ~11M records, and nothing large is shared across a
+fork (sharing a big dict across forked workers duplicates it page by page and
+got the workers OOM-killed, which leaves a multiprocessing pool hanging).
 """
 from __future__ import annotations
 
@@ -105,81 +109,137 @@ def score_stream(booster, records: dict, rows, threshold: float, label: str, tot
     print(f"  [{label}] {done:,}/{total:,} entities done in {(time.time() - t0) / 60:.1f} min", flush=True)
 
 
-def _span_rows(path: str, start: int, end: int):
-    for i, row in enumerate(iter_candidates(path)):
-        if i < start:
-            continue
-        if i >= end:
-            break
-        yield row
+def load_s1_countries(preprocessed: str, split: str) -> dict[str, str]:
+    import pyarrow.parquet as pq
+
+    path = os.path.join(preprocessed, f"{split}_s1.parquet")
+    out: dict[str, str] = {}
+    pf = pq.ParquetFile(path)
+    for batch in pf.iter_batches(batch_size=500_000, columns=["entity_id", "country"]):
+        data = batch.to_pydict()
+        for eid, country in zip(data["entity_id"], data["country"]):
+            out[eid] = "" if country is None else str(country)
+    return out
+
+
+def split_jobs(candidates: str, countries: dict[str, str], workers: int, work_dir: str) -> tuple[list[dict], int]:
+    """Write one input file per job. Rows of one country stay together so a
+    job only needs that country's records."""
+    per_country: dict[str, int] = {}
+    n_rows = 0
+    for eid, _ in iter_candidates(candidates):
+        c = countries.get(eid, "")
+        per_country[c] = per_country.get(c, 0) + 1
+        n_rows += 1
+    target = max(1, -(-n_rows // max(workers, 1)))
+    chunk_size: dict[str, int] = {}
+    for c, n in per_country.items():
+        k = max(1, -(-n // target))
+        chunk_size[c] = -(-n // k)
+    os.makedirs(work_dir, exist_ok=True)
+    handles: dict[tuple[str, int], object] = {}
+    jobs: dict[tuple[str, int], dict] = {}
+    seen: dict[str, int] = {}
+    with open(candidates, encoding="utf-8") as src:
+        src.readline()
+        for line in src:
+            if not line.strip():
+                continue
+            eid = line.split("\t", 1)[0]
+            c = countries.get(eid, "")
+            i = seen.get(c, 0)
+            seen[c] = i + 1
+            key = (c, i // chunk_size[c])
+            h = handles.get(key)
+            if h is None:
+                idx = len(jobs)
+                path = os.path.join(work_dir, f"job{idx}.in.tsv")
+                h = open(path, "w", encoding="utf-8", newline="\n")
+                h.write("source1_entity_id\tcandidate_entity_ids\n")
+                handles[key] = h
+                jobs[key] = {"idx": idx, "label": f"{c or '?'}#{key[1]}", "input": path, "rows": 0}
+            h.write(line if line.endswith("\n") else line + "\n")
+            jobs[key]["rows"] += 1
+    for h in handles.values():
+        h.close()
+    return sorted(jobs.values(), key=lambda j: -j["rows"]), n_rows
 
 
 _PRED: dict = {}
 
 
-def _predict_span(job: tuple[int, int, int]) -> tuple[int, str, int, int]:
+def _predict_job(job: dict) -> tuple[int, str, int, int]:
     import lightgbm as lgb
 
-    idx, start, end = job
     state = _PRED
+    t0 = time.time()
+    need, n_rows = collect_need(job["input"])
+    records = load_records(state["preprocessed"], need, names=state["names"])
+    del need
+    print(f"  [{job['label']}] loaded {len(records):,} records for {n_rows:,} entities in {time.time() - t0:.0f}s", flush=True)
     booster = lgb.Booster(model_file=state["model"])
-    part = f"{state['output']}.part{idx}"
+    part = job["input"].replace(".in.tsv", ".out.tsv")
     written = matched = 0
     with open(part, "w", encoding="utf-8", newline="\n") as handle:
-        rows = _span_rows(state["candidates"], start, end)
-        for eid, chosen in score_stream(booster, state["records"], rows, state["threshold"], f"worker {idx}", end - start):
+        rows = iter_candidates(job["input"])
+        for eid, chosen in score_stream(booster, records, rows, state["threshold"], job["label"], n_rows):
             handle.write(eid + "\t" + ",".join(chosen) + "\n")
             written += 1
             matched += len(chosen)
-    return idx, part, written, matched
+    del records
+    os.remove(job["input"])
+    return job["idx"], part, written, matched
 
 
 def run(args: argparse.Namespace) -> None:
-    import lightgbm as lgb
-
     with open(args.meta, encoding="utf-8") as handle:
         meta = json.load(handle)
     threshold = float(meta["threshold"])
     print(f"Threshold {threshold:.3f}", flush=True)
-    names = ("test_s1", "test_s2", "test_s3") if args.split == "test" else ("train_s1", "train_s2", "train_s3")
-    print("Collecting ids", flush=True)
-    need, n_rows = collect_need(args.candidates)
-    print(f"Loading {len(need):,} records", flush=True)
-    records = load_records(args.preprocessed, need, names=names)
-    del need
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    workers = getattr(args, "workers", 0) or (4 if os.name == "posix" and n_rows >= 4000 else 1)
-    print(f"Scoring {n_rows:,} entities on {workers} core(s)", flush=True)
+    split = args.split
+    names = (f"{split}_s1", f"{split}_s2", f"{split}_s3")
+    workers = getattr(args, "workers", 0) or (4 if os.name == "posix" else 1)
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    work_dir = os.path.join(out_dir, "_predict_jobs")
+    os.makedirs(out_dir, exist_ok=True)
+
+    print("Splitting candidates by country", flush=True)
+    countries = load_s1_countries(args.preprocessed, split)
+    jobs, n_rows = split_jobs(args.candidates, countries, workers, work_dir)
+    del countries
+    for job in jobs:
+        print(f"  job {job['label']}: {job['rows']:,} entities", flush=True)
+    print(f"Scoring {n_rows:,} entities in {len(jobs)} job(s) on {workers} process(es)", flush=True)
+
+    _PRED.clear()
+    _PRED.update(preprocessed=args.preprocessed, names=names, model=args.model, threshold=threshold)
     t0 = time.time()
-    matched = written = 0
-    if workers == 1:
-        booster = lgb.Booster(model_file=args.model)
-        with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write("source1_entity_id\tmatched_entity_ids\n")
-            for eid, chosen in score_stream(booster, records, iter_candidates(args.candidates), threshold, "main", n_rows):
-                handle.write(eid + "\t" + ",".join(chosen) + "\n")
-                written += 1
-                matched += len(chosen)
+    if workers == 1 or len(jobs) == 1:
+        results = [_predict_job(job) for job in jobs]
     else:
         import multiprocessing as mp
 
-        step = (n_rows + workers - 1) // workers
-        jobs = [(k, s, min(s + step, n_rows)) for k, s in enumerate(range(0, n_rows, step))]
-        _PRED.clear()
-        _PRED.update(candidates=args.candidates, model=args.model, records=records, threshold=threshold, output=args.output)
         ctx = mp.get_context("fork")
-        with ctx.Pool(len(jobs)) as pool:
-            results = sorted(pool.map(_predict_span, jobs))
-        _PRED.clear()
-        with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write("source1_entity_id\tmatched_entity_ids\n")
-            for _, part, n_written, n_matched in results:
-                with open(part, encoding="utf-8") as src:
-                    for line in src:
-                        handle.write(line)
-                os.remove(part)
-                written += n_written
-                matched += n_matched
+        with ctx.Pool(min(workers, len(jobs)), maxtasksperchild=1) as pool:
+            results = pool.map(_predict_job, jobs, chunksize=1)
+    _PRED.clear()
+
+    written = matched = 0
+    with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("source1_entity_id\tmatched_entity_ids\n")
+        for _, part, n_written, n_matched in sorted(results):
+            with open(part, encoding="utf-8") as src:
+                for line in src:
+                    handle.write(line)
+            os.remove(part)
+            written += n_written
+            matched += n_matched
+    try:
+        os.rmdir(work_dir)
+    except OSError:
+        pass
+    if written != n_rows:
+        raise RuntimeError(f"wrote {written:,} rows but the candidate file has {n_rows:,}")
     print(f"Wrote {args.output}  entities={written:,}  matches={matched:,}  in {(time.time() - t0) / 60:.1f} min", flush=True)
 
 
@@ -191,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--meta", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--split", choices=["test", "train"], default="test")
-    p.add_argument("--workers", type=int, default=0, help="0 = 4 on Linux, 1 elsewhere")
+    p.add_argument("--workers", type=int, default=0, help="0 = 4 on Linux, 1 elsewhere; lower it if memory is tight")
     return p.parse_args()
 
 
