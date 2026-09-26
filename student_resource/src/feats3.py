@@ -38,7 +38,24 @@ STRING_COLS = [
 ]
 FLAG_COLS = ["dom_q", "scr_q", "s3_q", "q_addr_empty", "s_addr_empty", "q_name_len", "s_name_len", "q_name_empty"]
 RET_COLS = ["ret_rank", "ret_score", "ret_rel", "ret_gap_q", "ret_ncand", "ret_next_gap"]
-FEATURES = KERNEL_COLS + STRING_COLS + FLAG_COLS + RET_COLS
+# Learned log-odds (diff3) of the name words one side has and the other lacks,
+# plus how the numbers differ: a one-digit substitution marks a look-alike
+# business, a dropped or inserted digit marks a typo of the same one.
+DIFF_COLS = [
+    "d_add_min", "d_add_max", "d_add_sum", "d_add_n", "d_add_unk",
+    "d_drop_min", "d_drop_max", "d_drop_sum", "d_drop_n", "d_drop_unk",
+    "num_q_only", "num_s_only", "num_sub1", "num_indel1", "lnum_rel",
+    "px_add_min", "px_add_max", "px_add_sum", "px_add_n", "px_add_unk",
+    "px_drop_min", "px_drop_max", "px_drop_sum", "px_drop_n", "px_drop_unk",
+]
+FEATURES = KERNEL_COLS + STRING_COLS + FLAG_COLS + RET_COLS + DIFF_COLS
+
+_DIFF_TABLE: dict | None = None
+
+
+def set_diff_table(table: dict | None) -> None:
+    global _DIFF_TABLE
+    _DIFF_TABLE = table
 
 
 class Table:
@@ -150,7 +167,22 @@ def build_tables(s1: pd.DataFrame, q: pd.DataFrame) -> tuple[Table, Table, dict]
         t.phon_len = df["phon"].str.len().to_numpy(np.int32)
         tables.append(t)
     info = {"w_name": w_name, "w_addr": w_addr, "df_name": df_name.astype(np.int64)}
+    info["words"] = pd.Series(np.asarray(word_uni, dtype=object))
+    _attach(info, "", _DIFF_TABLE)
+    _attach(info, "p", None)
     return tables[0], tables[1], info
+
+
+def _attach(info: dict, prefix: str, table: dict | None) -> None:
+    words = info["words"]
+    for key in ("add", "drop"):
+        lo = table.get(key, {}) if table else {}
+        info[prefix + key + "_lo"] = words.map(lo).to_numpy(np.float32) if lo else np.full(len(words), np.nan, np.float32)
+
+
+def attach_proxy(info: dict, table: dict | None) -> None:
+    """Per split x country label-free word table (diff3.learn_proxy)."""
+    _attach(info, "p", table)
 
 
 @njit
@@ -426,6 +458,138 @@ def _kernel(qi, si, QN, SN, QA, SA, QP, SP, QX, QXL, SX, SXL, QU, SU, Qpin, Spin
         out[k, 32] = best
 
 
+@njit
+def _num_rel(a, la, b, lb):
+    """0 unrelated, 1 equal, 2 one-digit substitution, 3 one digit dropped/inserted."""
+    if la == lb and a == b:
+        return 1
+    if la < 2 or lb < 2 or not _lev_le1(a, la, b, lb):
+        return 0
+    return 2 if la == lb else 3
+
+
+@njit
+def _diff_side(A, a, B, b, lo, blank, out, k, c0):
+    mn = 0.0
+    mx = 0.0
+    sm = 0.0
+    n = 0
+    unk = 0
+    first = True
+    for i in range(A.shape[1]):
+        x = A[a, i]
+        if x < 0:
+            break
+        found = False
+        for j in range(B.shape[1]):
+            y = B[b, j]
+            if y < 0:
+                break
+            if y == x:
+                found = True
+                break
+        if found:
+            continue
+        n += 1
+        v = lo[x]
+        if blank or v != v:
+            unk += 1
+            continue
+        sm += v
+        if first or v < mn:
+            mn = v
+        if first or v > mx:
+            mx = v
+        first = False
+    out[k, c0] = mn
+    out[k, c0 + 1] = mx
+    out[k, c0 + 2] = sm
+    out[k, c0 + 3] = n
+    out[k, c0 + 4] = unk
+
+
+@njit(parallel=True)
+def _diff_kernel(qi, si, QN, SN, QX, QXL, SX, SXL, add_lo, drop_lo, padd_lo, pdrop_lo, blank, out):
+    for k in prange(qi.shape[0]):
+        a = qi[k]
+        b = si[k]
+        _diff_side(QN, a, SN, b, add_lo, blank[k], out, k, 0)
+        _diff_side(SN, b, QN, a, drop_lo, blank[k], out, k, 5)
+        _diff_side(QN, a, SN, b, padd_lo, False, out, k, 15)
+        _diff_side(SN, b, QN, a, pdrop_lo, False, out, k, 20)
+        cq = 0
+        cs = 0
+        for i in range(QX.shape[1]):
+            if QX[a, i] < 0:
+                break
+            cq += 1
+        for j in range(SX.shape[1]):
+            if SX[b, j] < 0:
+                break
+            cs += 1
+        q_only = 0
+        sub = 0
+        indel = 0
+        lq = -1
+        ls = -1
+        for i in range(cq):
+            if lq < 0 or QXL[a, i] > QXL[a, lq]:
+                lq = i
+            hit = False
+            for j in range(cs):
+                if SX[b, j] == QX[a, i]:
+                    hit = True
+                    break
+            if hit:
+                continue
+            q_only += 1
+            rel = 0
+            for j in range(cs):
+                r = _num_rel(QX[a, i], QXL[a, i], SX[b, j], SXL[b, j])
+                if r > 1:
+                    rel = r
+                    break
+            if rel == 2:
+                sub += 1
+            elif rel == 3:
+                indel += 1
+        s_only = 0
+        for j in range(cs):
+            if ls < 0 or SXL[b, j] > SXL[b, ls]:
+                ls = j
+            hit = False
+            for i in range(cq):
+                if QX[a, i] == SX[b, j]:
+                    hit = True
+                    break
+            if not hit:
+                s_only += 1
+        out[k, 10] = q_only
+        out[k, 11] = s_only
+        out[k, 12] = sub
+        out[k, 13] = indel
+        if lq < 0 or ls < 0:
+            out[k, 14] = -1.0
+        else:
+            r = _num_rel(QX[a, lq], QXL[a, lq], SX[b, ls], SXL[b, ls])
+            out[k, 14] = 4.0 if r == 0 else float(r)
+
+
+def diff_features(TQ: Table, TS: Table, qa: np.ndarray, sa: np.ndarray, info: dict,
+                  blank: np.ndarray | None = None) -> np.ndarray:
+    """blank: per-pair mask that hides the supervised word table (train rows
+    standing in for a country whose vocabulary the table has never seen)."""
+    out = np.zeros((len(qa), len(DIFF_COLS)), np.float32)
+    if len(qa) == 0:
+        return out
+    if blank is None:
+        blank = np.zeros(len(qa), dtype=np.bool_)
+    _diff_kernel(qa.astype(np.int64), sa.astype(np.int64), TQ.name, TS.name, TQ.num, TQ.numlen,
+                 TS.num, TS.numlen, info["add_lo"], info["drop_lo"], info["padd_lo"], info["pdrop_lo"],
+                 blank.astype(np.bool_), out)
+    return out
+
+
 def kernel_features(TQ: Table, TS: Table, qa: np.ndarray, sa: np.ndarray, info: dict) -> np.ndarray:
     out = np.zeros((len(qa), len(KERNEL_COLS)), np.float32)
     if len(qa) == 0:
@@ -528,6 +692,7 @@ def pair_features(TQ: Table, TS: Table, info: dict, qa: np.ndarray, sa: np.ndarr
         string_features(TQ, TS, qa, sa, workers),
         flag_features(TQ, TS, qa, sa),
         retrieval_features(qa, rank, score),
+        diff_features(TQ, TS, qa, sa, info),
     ]).astype(np.float32)
 
 

@@ -18,6 +18,16 @@ Record-centric: every Source 2/3 record picks at most one Source-1 owner.
    stay, `--orphan-frac`), so the train world has test's ~5.8 Source 2/3 records
    per Source-1 entity instead of 4.7, and look-alike groups with no owner.
 3. Stage 1: pair model on all 20 candidates (two query folds, out-of-fold scores).
+   Besides overlap features it sees how the two records differ (`diff3.py`):
+   the log-odds of each name word one side adds or drops, learned from train
+   pairs (look-alikes add "industries", "holdings", "north"; variants of the
+   same business add "formerly", "fka", "center"), the same table learned
+   without labels per country from whether the house number is kept (so France
+   gets its own: "participations", "holding", "distribution"), and whether
+   numbers differ by one substituted digit (look-alike) or a dropped digit
+   (typo). 20% of train records hide the supervised table so the models also
+   learn to work from the label-free one. On the 10% slice: stage-1 logloss
+   0.00203 -> 0.00155, report F0.5 0.9913 -> 0.9921.
 4. Stage 2: top-3 candidates per record with context (runner-up gap, how
    contested the Source-1 entity is, similarity to the records already clustered
    on it), scored by a LightGBM + XGBoost + CatBoost blend (weights tuned on
@@ -54,6 +64,9 @@ Steps can also be run one at a time: `prep`, `retrieve`, `stage1`, `stage2`,
 `recut` rewrites the two output files from them in seconds, with the tuned
 rule or an override (`--method thr --thr 0.8`), and `--blank-countries France`
 empties one country's rows (a leaderboard probe for that country's score).
+`src/probe.py make` does the same on any existing `matching_results.tsv`
+(no rerun), and `src/probe.py solve` turns the two leaderboard scores into that
+country's F0.5.
 
 Quick local check on a 10% hash slice of train (no test outputs):
 

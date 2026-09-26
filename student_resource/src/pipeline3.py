@@ -35,6 +35,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import decide3  # noqa: E402
+import diff3  # noqa: E402
 import feats3  # noqa: E402
 import models3  # noqa: E402
 from common3 import bucket, countries, load_norm, load_queries, load_ret, owner_map, ret_path, safe  # noqa: E402
@@ -43,6 +44,9 @@ CTX_COLS = ["p1", "p1_rank", "p1_max_other", "p1_gap", "p1_sum_q", "p1_n_gt01",
             "s_psum_other", "s_pmax_other", "s_rank_of_q", "s_npairs"]
 S1_FEATURES = feats3.FEATURES
 S2_FEATURES = feats3.FEATURES + CTX_COLS + feats3.SIB_COLS + feats3.NB_COLS
+# Share of train records whose pairs see no supervised word table, so the
+# models also learn to lean on the label-free one (France has no train data).
+BLANK_PCT = 20
 THR_GRID = [round(x, 3) for x in np.arange(0.10, 0.951, 0.025)] + [0.96, 0.97, 0.98, 0.99]
 
 
@@ -74,8 +78,12 @@ class Ctx:
             s1 = s1.set_index("entity_id").loc[list(self.s_ids)].reset_index()
             q = q.set_index("entity_id").loc[list(self.q_ids)].reset_index()
             self.TS, self.TQ, self.info = feats3.build_tables(s1, q)
+            feats3.attach_proxy(self.info, diff3.load_proxy(work, split, country))
             del s1, q
             gc.collect()
+        self.blank_q = np.zeros(self.nq, dtype=bool)
+        if split == "train":
+            self.blank_q = bucket(["blank|" + e for e in self.q_ids], 100) < BLANK_PCT
         log(f"  [{split} {country}] queries {self.nq:,}  S1 {self.ns:,}  pairs {len(self.qa):,}  ({time.time() - t0:.0f}s)")
 
     def chunks(self, size: int):
@@ -98,6 +106,7 @@ class Ctx:
             feats3.string_features(self.TQ, self.TS, qa, sa, workers),
             feats3.flag_features(self.TQ, self.TS, qa, sa),
             self.ret_features(idx),
+            feats3.diff_features(self.TQ, self.TS, qa, sa, self.info, self.blank_q[qa]),
         ]).astype(np.float32)
 
     def ret_features(self, idx: np.ndarray) -> np.ndarray:
@@ -677,6 +686,16 @@ def main() -> None:
         prep(args)
     if args.cmd in ("retrieve", "all"):
         retrieve(args)
+    if args.cmd in ("stage1", "stage2", "predict", "all"):
+        learn = not os.path.exists(diff3.table_path(args.work)) or (args.force and args.cmd in ("stage1", "all"))
+        if learn:
+            log("DIFF TABLE: learning name-difference vocabulary")
+            diff3.learn(args.work, args.report_pct, args.tune_pct)
+        feats3.set_diff_table(diff3.load(args.work))
+        for split in ("train", "test"):
+            for country in countries_with_ret(args.work, split):
+                if learn or not os.path.exists(diff3.proxy_path(args.work, split, country)):
+                    diff3.learn_proxy(args.work, split, country)
     if args.cmd in ("stage1", "all"):
         stage1(args)
     if args.cmd in ("stage2", "all"):
