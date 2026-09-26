@@ -7,10 +7,17 @@ Record-centric: every Source 2/3 record picks at most one Source-1 owner.
 1. `norm3.py` learns an Indic→Latin token dictionary from train pairs (plus a
    phonetic fallback that works for any Indic script), and normalizes names,
    addresses, units, states and numbers per country label.
-2. `retrieve3.py` finds the top-10 Source-1 records for every Source 2/3 record
+2. `retrieve3.py` finds the top-20 Source-1 records for every Source 2/3 record
    with weighted sparse keys (words, word pairs, phonetic skeletons, numbers,
-   units, n-grams).
-3. Stage 1: pair model on all 10 candidates (two query folds, out-of-fold scores).
+   units, n-grams, and name-word x locality / name-word x number composites).
+   The composites matter at full size: common name words and cities exceed the
+   key frequency caps, their combination does not. On the full India index
+   owner recall@10 went from 0.974 to 0.985 and @1 from 0.945 to 0.964
+   (`src/ret_eval.py` measures this on a query sample).
+   On train, 20% of Source-1 entities are removed from the index (their records
+   stay, `--orphan-frac`), so the train world has test's ~5.8 Source 2/3 records
+   per Source-1 entity instead of 4.7, and look-alike groups with no owner.
+3. Stage 1: pair model on all 20 candidates (two query folds, out-of-fold scores).
 4. Stage 2: top-3 candidates per record with context (runner-up gap, how
    contested the Source-1 entity is, similarity to the records already clustered
    on it), scored by a LightGBM + XGBoost + CatBoost blend (weights tuned on
@@ -41,7 +48,12 @@ Every step skips outputs that already exist under `--work` (`norm/`, `ret/`,
 `models/`, `p1/`, `s2data/`), so a session can be resumed by attaching the
 previous version's `/kaggle/working` output. `--force` redoes a step.
 Steps can also be run one at a time: `prep`, `retrieve`, `stage1`, `stage2`,
-`train2` (re-tune stage 2 from saved features), `predict`.
+`train2` (re-tune stage 2 from saved features), `predict`, `recut`.
+
+`predict` saves the stage-2 probability of every test pair under `work/p2/`.
+`recut` rewrites the two output files from them in seconds, with the tuned
+rule or an override (`--method thr --thr 0.8`), and `--blank-countries France`
+empties one country's rows (a leaderboard probe for that country's score).
 
 Quick local check on a 10% hash slice of train (no test outputs):
 

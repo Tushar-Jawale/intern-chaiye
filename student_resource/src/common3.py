@@ -73,6 +73,19 @@ def dev_filter(s1: pd.DataFrame, q: pd.DataFrame, owner: dict[str, str], frac: f
     return s1, q[keep_q].reset_index(drop=True)
 
 
+def orphan_filter(s1: pd.DataFrame, frac: float) -> pd.DataFrame:
+    """Test-like world: drop a hash slice of Source-1 entities but keep every
+    Source 2/3 record, so the records of dropped entities have no owner in the
+    index. Test has ~5.8 Source 2/3 records per Source-1 entity against 4.67 in
+    train; dropping 20% of train Source-1 reproduces that ratio. The slice uses
+    its own salt so it is independent of the report/tune buckets."""
+    if frac <= 0:
+        return s1
+    b = np.fromiter((zlib.crc32(("orphan|" + s).encode()) % 1000 for s in s1["entity_id"].tolist()),
+                    dtype=np.int32, count=len(s1))
+    return s1[b >= int(frac * 1000)].reset_index(drop=True)
+
+
 def ret_path(work: str, split: str, country: str) -> str:
     return os.path.join(work, "ret", f"{split}_{safe(country)}.npz")
 

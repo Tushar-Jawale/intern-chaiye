@@ -42,7 +42,7 @@ from common3 import bucket, countries, load_norm, load_queries, load_ret, owner_
 CTX_COLS = ["p1", "p1_rank", "p1_max_other", "p1_gap", "p1_sum_q", "p1_n_gt01",
             "s_psum_other", "s_pmax_other", "s_rank_of_q", "s_npairs"]
 S1_FEATURES = feats3.FEATURES
-S2_FEATURES = feats3.FEATURES + CTX_COLS + feats3.SIB_COLS
+S2_FEATURES = feats3.FEATURES + CTX_COLS + feats3.SIB_COLS + feats3.NB_COLS
 THR_GRID = [round(x, 3) for x in np.arange(0.10, 0.951, 0.025)] + [0.96, 0.97, 0.98, 0.99]
 
 
@@ -340,7 +340,9 @@ def stage2_features(ctx: Ctx, st: P1Stats, idx: np.ndarray, workers: int) -> np.
     cx = st.ctx_features(ctx, idx)
     sib = feats3.sibling_features(ctx.TQ, ctx.info, ctx.qa[idx], ctx.sa[idx], st.best_s, st.q_best, st.tau,
                                   workers=workers)
-    return np.hstack([base, cx, sib]).astype(np.float32)
+    nb = feats3.sibling_features(ctx.TQ, ctx.info, ctx.qa[idx], ctx.sa[idx], st.best_s, st.q_best, 0.0,
+                                 cap=15, workers=workers)
+    return np.hstack([base, cx, sib, nb]).astype(np.float32)
 
 
 def _s2_data_path(work: str, country: str) -> str:
@@ -518,18 +520,24 @@ def train_stage2(args: argparse.Namespace) -> None:
 
 # ------------------------------------------------------------- predict ------
 
+def _p2_path(work: str, country: str) -> str:
+    return os.path.join(work, "p2", f"test_{safe(country)}.npz")
+
+
 def predict(args: argparse.Namespace) -> None:
+    """Stage-2 probabilities for every test pair that stage 2 sees, saved to
+    work/p2 so decisions can be re-cut without rescoring (see recut)."""
     meta_path = os.path.join(args.work, "models", "stage2_meta.json")
     with open(meta_path, encoding="utf-8") as handle:
         meta = json.load(handle)
     ens = models3.Ensemble.load(os.path.join(args.work, "models", "stage2"), args.gpu)
-    iso_x, iso_y = np.asarray(meta["iso_x"]), np.asarray(meta["iso_y"])
-    calib = lambda v: np.interp(v, iso_x, iso_y)  # noqa: E731
-    method, kw = meta["method"], meta["params"]
     top_m, tau = int(meta["top_m"]), float(meta["tau"])
-    matches: dict[str, list[str]] = {}
-    cands: dict[str, list[str]] = {}
+    os.makedirs(os.path.join(args.work, "p2"), exist_ok=True)
     for country in countries_with_ret(args.work, "test"):
+        path = _p2_path(args.work, country)
+        if os.path.exists(path) and not args.force:
+            log(f"  skip {path}")
+            continue
         t0 = time.time()
         ctx = Ctx(args.work, "test", country)
         p1 = np.load(_p1_path(args.work, "test", country))
@@ -539,15 +547,47 @@ def predict(args: argparse.Namespace) -> None:
         for a, b in _ranges(len(sel), args.chunk_pairs):
             p2[a:b] = ens.predict(stage2_features(ctx, st, sel[a:b], args.workers))
             log(f"    stage-2 scored {b:,}/{len(sel):,} ({time.time() - t0:.0f}s)")
-        bq, bs, bp = decide3.best_per_query(ctx.qa[sel], ctx.sa[sel], p2)
-        mask = decide3.select(bq, bs, bp, method, calib=calib if method == "ef" else None, **kw)
-        for qi, si in zip(bq[mask].tolist(), bs[mask].tolist()):
-            matches.setdefault(ctx.s_ids[si], []).append(ctx.q_ids[qi])
-        for qi, si in zip(ctx.qa[sel].tolist(), ctx.sa[sel].tolist()):
-            cands.setdefault(ctx.s_ids[si], []).append(ctx.q_ids[qi])
-        log(f"  [test {country}] matched records {int(mask.sum()):,} of {ctx.nq:,} ({time.time() - t0:.0f}s)")
+        np.savez(path, qa=ctx.qa[sel], sa=ctx.sa[sel], p2=p2, p1=p1[sel],
+                 q_ids=ctx.q_ids.astype(str), s_ids=ctx.s_ids.astype(str))
+        log(f"  [test {country}] stage-2 pairs {len(sel):,} -> {path} ({time.time() - t0:.0f}s)")
         del ctx, p1, st
         gc.collect()
+    recut(args)
+
+
+def recut(args: argparse.Namespace) -> None:
+    """Decisions from saved test probabilities. The tuned rule from
+    stage2_meta.json is the default; --method/--thr/--floor/--extra override it
+    and --blank-countries empties the rows of those countries (leaderboard
+    probe: the score change isolates one country's contribution)."""
+    with open(os.path.join(args.work, "models", "stage2_meta.json"), encoding="utf-8") as handle:
+        meta = json.load(handle)
+    iso_x, iso_y = np.asarray(meta["iso_x"]), np.asarray(meta["iso_y"])
+    calib = lambda v: np.interp(v, iso_x, iso_y)  # noqa: E731
+    method, kw = meta["method"], dict(meta["params"])
+    if args.method:
+        method = args.method
+        kw = {"thr": args.thr} if method == "thr" else {"floor": args.floor, "extra": args.extra}
+    blank = {c for c in args.blank_countries.split(",") if c}
+    log(f"RECUT method {method} {kw}" + (f"  blank countries {sorted(blank)}" if blank else ""))
+    matches: dict[str, list[str]] = {}
+    cands: dict[str, list[str]] = {}
+    for country in countries_with_ret(args.work, "test"):
+        z = np.load(_p2_path(args.work, country), allow_pickle=False)
+        qa, sa, p2, q_ids, s_ids = z["qa"], z["sa"], z["p2"], z["q_ids"], z["s_ids"]
+        for qi, si in zip(qa.tolist(), sa.tolist()):
+            cands.setdefault(s_ids[si], []).append(q_ids[qi])
+        if country in blank:
+            log(f"  [test {country}] blanked")
+            continue
+        bq, bs, bp = decide3.best_per_query(qa, sa, p2)
+        mask = decide3.select(bq, bs, bp, method, calib=calib if method == "ef" else None, **kw)
+        for qi, si in zip(bq[mask].tolist(), bs[mask].tolist()):
+            matches.setdefault(s_ids[si], []).append(q_ids[qi])
+        n_ent = len(np.unique(bs[mask]))
+        log(f"  [test {country}] matched records {int(mask.sum()):,} of {len(q_ids):,} "
+            f"({mask.sum() / max(len(q_ids), 1):.3f}); entities with a match {n_ent:,} of {len(s_ids):,} "
+            f"({n_ent / max(len(s_ids), 1):.3f})")
     s1_all = load_norm(args.work, "test_s1", None, ["entity_id"])["entity_id"].tolist()
     out = args.output or os.path.join(args.work, "output")
     os.makedirs(out, exist_ok=True)
@@ -585,31 +625,41 @@ def retrieve(args: argparse.Namespace) -> None:
             continue
         retrieve3.run(argparse.Namespace(work=args.work, split=split, country="", top_k=args.top_k, chunk=1000,
                                          workers=args.workers if args.workers > 0 else 0,
-                                         dev_frac=args.dev_frac if split == "train" else 1.0, force=args.force))
+                                         dev_frac=args.dev_frac if split == "train" else 1.0,
+                                         orphan_frac=args.orphan_frac if split == "train" else 0.0,
+                                         force=args.force))
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="v3 entity-resolution pipeline")
-    p.add_argument("cmd", choices=["prep", "retrieve", "stage1", "stage2", "train2", "predict", "all"])
+    p.add_argument("cmd", choices=["prep", "retrieve", "stage1", "stage2", "train2", "predict", "recut", "all"])
     p.add_argument("--data", default="dataset")
     p.add_argument("--work", default="work3")
     p.add_argument("--output", default="")
-    p.add_argument("--top-k", type=int, default=10)
+    p.add_argument("--top-k", type=int, default=20)
     p.add_argument("--top-m", type=int, default=3)
     p.add_argument("--tau", type=float, default=0.5, help="stage-1 probability that puts a record in a cluster")
     p.add_argument("--dev-frac", type=float, default=1.0, help="train only: hash slice of the world for quick runs")
+    p.add_argument("--orphan-frac", type=float, default=0.2,
+                   help="train only: share of Source-1 entities removed from the index (records kept) so the "
+                        "train world has test's ratio of unowned records")
     p.add_argument("--skip-test", action="store_true")
     p.add_argument("--report-pct", type=int, default=4)
     p.add_argument("--tune-pct", type=int, default=4)
     p.add_argument("--s1-models", default="", help="default xgb on GPU, lgb otherwise")
     p.add_argument("--s2-models", default="", help="default lgb,xgb,cat")
-    p.add_argument("--s1-fit-queries", type=int, default=300_000, help="per fold per country")
+    p.add_argument("--s1-fit-queries", type=int, default=250_000, help="per fold per country")
     p.add_argument("--s2-fit-queries", type=int, default=600_000, help="per country")
     p.add_argument("--chunk-pairs", type=int, default=1_000_000)
     p.add_argument("--workers", type=int, default=-1)
     p.add_argument("--gpu", default="auto", choices=["auto", "yes", "no"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--method", default="", choices=["", "thr", "ef"], help="recut: override the tuned rule")
+    p.add_argument("--thr", type=float, default=0.5)
+    p.add_argument("--floor", type=float, default=0.05)
+    p.add_argument("--extra", type=float, default=0.0)
+    p.add_argument("--blank-countries", default="", help="recut: comma list of countries whose rows stay empty")
     a = p.parse_args()
     a.gpu = models3.gpu_available() if a.gpu == "auto" else a.gpu == "yes"
     if not a.s1_models:
@@ -635,6 +685,8 @@ def main() -> None:
         train_stage2(args)
     if args.cmd in ("predict", "all") and not args.skip_test:
         predict(args)
+    if args.cmd == "recut":
+        recut(args)
     log(f"done in {(time.time() - t0) / 60:.1f} min")
 
 

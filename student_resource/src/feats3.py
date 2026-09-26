@@ -533,6 +533,11 @@ def pair_features(TQ: Table, TS: Table, info: dict, qa: np.ndarray, sa: np.ndarr
 
 SIB_COLS = ["sib_n", "sib_n_s2", "sib_n_s3", "sib_max_p", "sib_mean_p", "sib_n_wjacc", "sib_a_wjacc",
             "sib_num_jacc", "sib_num_near", "sib_unit", "sib_n_tset", "sib_a_tset", "sib_best"]
+# Same summaries over every record whose best Source-1 candidate is s, whatever
+# its probability. Records of a business that is missing from Source 1 tend to
+# pile onto one look-alike entity with low probabilities while being very
+# similar to each other; the confident-only SIB_COLS cannot see that.
+NB_COLS = ["nb" + c[3:] for c in SIB_COLS]
 
 
 def sibling_features(TQ: Table, info: dict, pair_q: np.ndarray, pair_s: np.ndarray, best_s: np.ndarray,

@@ -31,10 +31,14 @@ import scipy.sparse as sp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common3 import countries, dev_filter, load_norm, load_queries, owner_map, ret_path  # noqa: E402
+from common3 import countries, dev_filter, load_norm, load_queries, orphan_filter, owner_map, ret_path  # noqa: E402
 
-KINDS = ["name", "npair", "phon", "addr", "apair", "num", "sig", "comp", "unit", "pref", "ngname", "ngaddr"]
+KINDS = ["name", "npair", "phon", "addr", "apair", "num", "sig", "comp", "unit", "pref", "ngname", "ngaddr",
+         "nloc", "nnum", "ploc"]
 # kind -> (max_df, weight). max_df None means scaled to the index size.
+# nloc / nnum / ploc tie a name word (or the pair of the two longest name words)
+# to a locality word or an address number: each part alone is often too common
+# to keep at 1M records, the combination rarely is.
 SPECS = {
     "name": (1500, 1.0),
     "npair": (8000, 2.4),
@@ -48,7 +52,12 @@ SPECS = {
     "pref": (300, 0.8),
     "ngname": (None, 1.5),
     "ngaddr": (None, 1.1),
+    "nloc": (600, 1.6),
+    "nnum": (600, 1.8),
+    "ploc": (400, 2.2),
 }
+CAP_SCALE = float(os.environ.get("ER_CAP_SCALE", "1.0"))
+USE_KINDS = set(os.environ.get("ER_KINDS", ",".join(KINDS)).split(","))
 EXACT_BONUS = 40.0
 EXACT_MAX_GROUP = 400
 EXACT_SMALL_GROUP = 80
@@ -79,6 +88,9 @@ def rec_keys(core: str, phon: str, ad: str, nums: str, units: str) -> dict[str, 
     sig = "#".join(sorted(set(num_list))) if len(set(num_list)) >= 2 else ""
     use_nums = [n for n in num_list if len(n) >= 2][:5]
     use_words = [w for w in addr_words if len(w) >= 4][:5]
+    top_words = sorted(set(words), key=lambda w: (-len(w), w))[:4]
+    loc = list(dict.fromkeys(addr_words[-2:]))
+    top_pair = "_".join(sorted(top_words[:2])) if len(top_words) >= 2 else ""
     return {
         "name": words,
         "npair": _pairs(words),
@@ -92,6 +104,9 @@ def rec_keys(core: str, phon: str, ad: str, nums: str, units: str) -> dict[str, 
         "pref": [longest[:5]] if len(longest) >= 5 else [],
         "ngname": _ngrams(core),
         "ngaddr": _ngrams(ad),
+        "nloc": [w + "|" + c for w in top_words for c in loc if c != w],
+        "nnum": [w + "|" + n for w in top_words for n in num_list[:4]],
+        "ploc": ([top_pair + "|" + c for c in loc] + [top_pair + "|" + n for n in num_list[:3]]) if top_pair else [],
         "exact": [" ".join(sorted(set(words)))] if words else [],
     }
 
@@ -120,6 +135,8 @@ def _emit(fields, start: int, end: int, exact_df: dict[int, int] | None):
         ks = rec_keys(core[i], phon[i], ad[i], nums[i], units[i])
         r = i - start
         for kind in KINDS:
+            if kind not in USE_KINDS:
+                continue
             kid = _KIND_ID[kind]
             for key in ks[kind]:
                 rows.append(r)
@@ -135,8 +152,9 @@ def _emit(fields, start: int, end: int, exact_df: dict[int, int] | None):
 
 
 class Index:
-    def __init__(self, s1: pd.DataFrame):
+    def __init__(self, s1: pd.DataFrame, cap_scale: float | None = None):
         t0 = time.time()
+        cap_scale = CAP_SCALE if cap_scale is None else cap_scale
         self.n = len(s1)
         fields = _fields(s1)
         ex_counts: dict[int, int] = {}
@@ -164,7 +182,8 @@ class Index:
         uniq, first, df = np.unique(hs, return_index=True, return_counts=True)
         ukind = kd[first]
         ng_cap = min(25000, max(80, self.n // 400))
-        max_df = np.array([SPECS[k][0] if SPECS[k][0] is not None else ng_cap for k in KINDS] + [EXACT_MAX_GROUP], np.int64)
+        max_df = np.array([max(20, int(SPECS[k][0] * cap_scale)) if SPECS[k][0] is not None else ng_cap
+                           for k in KINDS] + [EXACT_MAX_GROUP], np.int64)
         base = np.array([SPECS[k][1] for k in KINDS] + [0.0], np.float32)
         keep = df <= max_df[ukind]
         weight = base[ukind] * np.log((self.n + 1) / df).astype(np.float32)
@@ -281,12 +300,22 @@ def run(args: argparse.Namespace) -> None:
         t0 = time.time()
         s1 = load_norm(args.work, f"{split}_s1", country)
         q = load_queries(args.work, split, country)
+        cap_scale = CAP_SCALE
         if split == "train" and args.dev_frac < 1.0:
             s1, q = dev_filter(s1, q, owner, args.dev_frac)
-        print(f"\n=== {split} {country}: S1={len(s1):,} queries={len(q):,} ===", flush=True)
+            # caps shrink with the world so a dev slice drops keys like the full index does
+            cap_scale *= args.dev_frac
+        if split == "train":
+            n_before = len(s1)
+            s1 = orphan_filter(s1, getattr(args, "orphan_frac", 0.0))
+            if len(s1) < n_before:
+                print(f"  test-like world: dropped {n_before - len(s1):,} of {n_before:,} Source-1 entities "
+                      f"(their records stay as unowned queries)", flush=True)
+        print(f"\n=== {split} {country}: S1={len(s1):,} queries={len(q):,} "
+              f"({len(q) / max(len(s1), 1):.2f} per S1) ===", flush=True)
         if len(s1) == 0 or len(q) == 0:
             continue
-        index = Index(s1)
+        index = Index(s1, cap_scale)
         qa, sa, ra, va = search(index, q, args.top_k, args.chunk, workers)
         del index
         gc.collect()
@@ -331,6 +360,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk", type=int, default=1000)
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--dev-frac", type=float, default=1.0)
+    p.add_argument("--orphan-frac", type=float, default=0.0)
     p.add_argument("--force", action="store_true")
     p.add_argument("--self-test", action="store_true")
     return p.parse_args()
