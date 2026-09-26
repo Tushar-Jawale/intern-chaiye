@@ -258,6 +258,8 @@ _FR_REGIONS = {
     "ile de france": "idf", "grand est": "ges", "bretagne": "bre", "normandie": "nor",
     "occitanie": "occ", "provence alpes cote d azur": "pac", "auvergne rhone alpes": "ara",
     "bourgogne franche comte": "bfc", "centre val de loire": "cvl", "corse": "cor",
+    # Source 2/3 often name the departement where Source 1 names the region.
+    "gironde": "naq", "loire atlantique": "pdl", "nord": "hdf", "pas de calais": "hdf",
 }
 
 
